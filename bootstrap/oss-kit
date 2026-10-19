@@ -588,13 +588,19 @@ cmd_new() {
   MODE=apply
   load_repo "$OWNER/$name"
   apply_all 0 1 0 "$topics" v0.1.0
+  next_steps "$OWNER/$name" "$target" "$stack" >&2
+}
 
-  cat >&2 <<EOF
+# next_steps REPO LOCAL_DIR STACK
+next_steps() {
+  local title="ci: add $3 CI"
+  [ "$3" != none ] || title="<type>: <first change>"
+  cat <<EOF
 
-Done: https://github.com/$OWNER/$name  (local: $target)
-Next: open the first issue in milestone v0.1.0 for the stack CI, then follow
-the draft-first flow (docs/conventions.md in $KIT_REPO):
-  gh issue create -R $OWNER/$name --title "ci: add $stack CI" --milestone v0.1.0
+Done: https://github.com/$1  (local: $2)
+Next: open the first issue in milestone v0.1.0, then follow the draft-first
+flow (docs/conventions.md in $KIT_REPO):
+  gh issue create -R $1 --title "$title" --milestone v0.1.0
 EOF
 }
 

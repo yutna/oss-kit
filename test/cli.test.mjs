@@ -227,6 +227,14 @@ test('dependabot_block follows the core conventions', () => {
   }
 })
 
+test('next_steps names the stack CI issue, and no stack for "none"', () => {
+  const node = lib('next_steps yutna/my-lib /tmp/my-lib node').out
+  assert.match(node, /--title "ci: add node CI" --milestone v0\.1\.0/)
+  const none = lib('next_steps yutna/my-lib /tmp/my-lib none').out
+  assert.doesNotMatch(none, /none CI/)
+  assert.match(none, /--milestone v0\.1\.0/)
+})
+
 // --- commands ---------------------------------------------------------------
 
 function fakeGh(dir, script) {
