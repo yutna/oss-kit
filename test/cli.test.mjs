@@ -392,3 +392,72 @@ test('CI runs the CLI tests on macOS, where /bin/bash is 3.2', () => {
   const ci = readFileSync(fileURLToPath(new URL('../.github/workflows/ci.yml', import.meta.url)), 'utf8')
   assert.match(ci, /macos-latest/)
 })
+
+// --- new: validation, resume (deferred minors) -------------------------------
+
+test('new rejects a description containing a placeholder before creating anything', () => {
+  const d = tmp()
+  const bin = fakeGh(d, 'exit 0')
+  const r = cli(['new', 'x', '--description', 'uses {{REPO}} here', '--dir', d], { bin })
+  assert.equal(r.status, 2)
+  assert.match(r.err, /description/)
+  assert.ok(!readFileSync(join(d, 'gh.log'), 'utf8').includes('repo create'))
+})
+
+test('new --resume refuses a repository that does not exist', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `case "$*" in
+  "api user --jq .login") echo yutna ;;
+  *) exit 1 ;;
+esac`)
+  const r = cli(['new', 'x', '--description', 'd', '--dir', d, '--resume'], { bin })
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /--resume: yutna\/x does not exist/)
+  assert.ok(!readFileSync(join(d, 'gh.log'), 'utf8').includes('repo create'))
+})
+
+test('new prints the command to resume when it stops after creating the repository', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `case "$*" in
+  "api user --jq .login") echo yutna ;;
+  "api repos/yutna/x --silent") exit 1 ;;
+  "api repos/yutna/oss-template --jq .is_template") echo true ;;
+  "repo create "*) ;;
+  "api repos/yutna/x/commits?per_page=1 --silent") ;;
+  "repo clone "*) echo "clone failed" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 99 ;;
+esac`)
+  const r = cli(['new', 'x', '--description', "it's new", '--dir', d], { bin })
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /oss-kit new x --description .*--resume/)
+})
+
+test('add_stack_extras is idempotent', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `case "$*" in
+  "api gitignore/templates/Node --jq .source") echo "node_modules/" ;;
+  *) exit 99 ;;
+esac`)
+  mkdirSync(join(d, 'repo/.github'), { recursive: true })
+  writeFileSync(join(d, 'repo/.gitignore'), '.DS_Store\n')
+  writeFileSync(join(d, 'repo/.github/dependabot.yml'), 'version: 2\nupdates:\n')
+  const r = lib(`add_stack_extras "${join(d, 'repo')}" node && add_stack_extras "${join(d, 'repo')}" node`,
+    { env: { PATH: `${bin}:${process.env.PATH}` } })
+  assert.equal(r.status, 0, r.err)
+  const gitignore = readFileSync(join(d, 'repo/.gitignore'), 'utf8')
+  const dependabot = readFileSync(join(d, 'repo/.github/dependabot.yml'), 'utf8')
+  assert.equal(gitignore.split('# --- Node (github/gitignore) ---').length - 1, 1, gitignore)
+  assert.equal(gitignore.split('node_modules/').length - 1, 1)
+  assert.equal(dependabot.split('package-ecosystem: npm').length - 1, 1, dependabot)
+})
+
+test('a ci-ok job indented by four spaces counts as the gate', () => {
+  const d = tmp()
+  const bin = compliantRepoGh(d, `  *"/rulesets?includes_parents=false") echo '[]' ;;
+  *"/git/trees/main?recursive=1"*) printf '.github/workflows/ci.yml\\n.github/workflows/pr-check.yml\\n' ;;
+  *"/contents/.github/workflows/ci.yml"*) printf 'jobs:\\n    ci-ok:\\n        runs-on: ubuntu-latest\\n' ;;
+  *"/contents/.github/workflows/pr-check.yml"*) printf 'jobs:\\n  pr-check:\\n    uses: yutna/oss-kit/.github/workflows/pr-check.yml@main\\n' ;;`)
+  const r = cli(['apply', 'yutna/ollama-bar', '--dry-run'], { bin })
+  assert.equal(r.status, 0, r.err)
+  assert.match(r.err, /would: create ruleset "main"/)
+})
