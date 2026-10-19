@@ -42,13 +42,13 @@ KIT_DIR=$(kit_dir)
 usage() {
   cat <<'EOF'
 usage: oss-kit new <name> --description "<text>" [--topics a,b,c] [--stack <stack>]
-                          [--dir ~/Projects] [--dry-run]
+                          [--dir ~/Projects] [--dry-run] [--resume]
        oss-kit apply <owner/repo> [--dry-run] [--migrate-labels] [--prune-labels]
                           [--skip-rulesets] [--topics a,b,c] [--milestone vX.Y.Z]
        oss-kit doctor <owner/repo>
 
   new     create <owner>/<name> from oss-template, fill placeholders, add stack
-          extras, push, then apply.
+          extras, push, then apply. --resume finishes a new that stopped part-way.
   apply   bring settings, security, labels, milestones and rulesets in line.
   doctor  read-only: report drift from the spec; exit 1 when there is any.
 
@@ -199,6 +199,20 @@ stack_ecosystem() {
     none) echo "" ;;
     *) return 1 ;;
   esac
+}
+
+# add_stack_extras DIR STACK — appends the stack's gitignore templates and
+# Dependabot entry, once: running it again (new --resume) adds nothing.
+add_stack_extras() {
+  local dir="$1" t src eco
+  for t in $(stack_gitignore "$2"); do
+    ! grep -qxF "# --- $t (github/gitignore) ---" "$dir/.gitignore" 2> /dev/null || continue
+    src=$(gh api "gitignore/templates/$t" --jq .source) || die "cannot fetch the $t gitignore template"
+    printf '\n# --- %s (github/gitignore) ---\n%s\n' "$t" "$src" >> "$dir/.gitignore"
+  done
+  eco=$(stack_ecosystem "$2")
+  [ -z "$eco" ] || grep -qE "^  - package-ecosystem: $eco$" "$dir/.github/dependabot.yml" ||
+    dependabot_block "$eco" >> "$dir/.github/dependabot.yml"
 }
 
 # A Dependabot "updates" entry with the core conventions. Minor and patch
@@ -466,7 +480,7 @@ fetch_workflows() {
 # i.e. the checks the main ruleset requires will actually report.
 gate_ready() {
   fetch_workflows
-  grep -qE '^  ci-ok:' "$WORK"/workflows/* 2> /dev/null &&
+  grep -qE '^[[:space:]]+ci-ok:[[:space:]]*$' "$WORK"/workflows/* 2> /dev/null &&
     grep -qE "uses: *($KIT_REPO|\.)/\.github/workflows/pr-check\.yml" "$WORK"/workflows/* 2> /dev/null
 }
 
@@ -487,7 +501,7 @@ check_files() {
       act "no workflow calls $KIT_REPO/.github/workflows/$wf.yml" true
     }
   done
-  grep -qE '^  ci-ok:' "$WORK"/workflows/* 2> /dev/null || {
+  grep -qE '^[[:space:]]+ci-ok:[[:space:]]*$' "$WORK"/workflows/* 2> /dev/null || {
     clean=0
     act "no workflow has a ci-ok gate job" true
   }
@@ -556,7 +570,7 @@ cmd_doctor() {
 }
 
 cmd_new() {
-  local name="" description="" topics="" stack=none dir="$HOME/Projects" dry=0 target i branch t
+  local name="" description="" topics="" stack=none dir="$HOME/Projects" dry=0 resume=0 target i branch
   while [ $# -gt 0 ]; do
     case "$1" in
       --description) description="${2:?--description needs a value}"; shift ;;
@@ -564,6 +578,7 @@ cmd_new() {
       --stack) stack="${2:?--stack needs a value}"; shift ;;
       --dir) dir="${2:?--dir needs a value}"; shift ;;
       --dry-run) dry=1 ;;
+      --resume) resume=1 ;;
       -*) usage_error "new: unknown option $1" ;;
       *) [ -z "$name" ] || usage_error "new: one name at a time"; name="$1" ;;
     esac
@@ -574,15 +589,34 @@ cmd_new() {
     die "never create $OWNER/.github: its community files would apply to private repositories too"
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || usage_error "new: invalid repository name \"$name\""
   [ -n "$description" ] || usage_error "new: --description is required"
+  # Checked before anything exists: a placeholder here would fail the fill
+  # after the public repository was already created.
+  case "$description" in
+    *'{{'* | *'}}'*) usage_error "new: --description must not contain {{ or }}" ;;
+  esac
   valid_stack "$stack" || usage_error "new: unknown --stack \"$stack\" (one of: $STACKS)"
   target="$dir/$name"
 
   step "preflight"
   [ "$(gh api user --jq .login)" = "$OWNER" ] || die "gh is not logged in as $OWNER"
-  ! gh api "repos/$OWNER/$name" --silent 2> /dev/null || die "$OWNER/$name already exists"
-  [ "$(gh api "repos/$TEMPLATE" --jq .is_template 2> /dev/null)" = true ] ||
-    die "$TEMPLATE is missing or not marked as a template"
-  [ ! -e "$target" ] || die "$target already exists"
+  if [ "$resume" = 1 ]; then
+    gh api "repos/$OWNER/$name" > "$WORK/new.json" 2> /dev/null ||
+      die "--resume: $OWNER/$name does not exist; run new without --resume"
+    [ "$(jq -r '.template_repository.full_name // empty' "$WORK/new.json")" = "$TEMPLATE" ] ||
+      die "--resume: $OWNER/$name was not created from $TEMPLATE"
+    if [ -e "$target" ]; then
+      case "$(git -C "$target" remote get-url origin 2> /dev/null)" in
+        *"$OWNER/$name" | *"$OWNER/$name.git") ;;
+        *) die "--resume: $target exists but is not a clone of $OWNER/$name" ;;
+      esac
+    fi
+  else
+    ! gh api "repos/$OWNER/$name" --silent 2> /dev/null ||
+      die "$OWNER/$name already exists (to finish an interrupted new, add --resume)"
+    [ "$(gh api "repos/$TEMPLATE" --jq .is_template 2> /dev/null)" = true ] ||
+      die "$TEMPLATE is missing or not marked as a template"
+    [ ! -e "$target" ] || die "$target already exists"
+  fi
   log "  ok"
   if [ "$dry" = 1 ]; then
     log ""
@@ -592,37 +626,45 @@ cmd_new() {
   fi
 
   step "create $OWNER/$name"
-  gh repo create "$OWNER/$name" --public --template "$TEMPLATE" --description "$description" > /dev/null
-  i=0
-  until gh api "repos/$OWNER/$name/commits?per_page=1" --silent 2> /dev/null; do
-    i=$((i + 1))
-    [ "$i" -lt 30 ] || die "the template copy did not finish within 60 s"
-    sleep 2
-  done
-  log "  created https://github.com/$OWNER/$name"
+  # From here on a failure leaves a public repository behind; say how to finish it.
+  NEW_HINT="$(basename "$0") new $name --description $(printf '%q' "$description") --stack $stack"
+  [ -z "$topics" ] || NEW_HINT="$NEW_HINT --topics $topics"
+  NEW_HINT="$NEW_HINT --dir $(printf '%q' "$dir") --resume"
+  if [ "$resume" = 1 ]; then
+    log "  exists (resuming)"
+  else
+    gh repo create "$OWNER/$name" --public --template "$TEMPLATE" --description "$description" > /dev/null
+    i=0
+    until gh api "repos/$OWNER/$name/commits?per_page=1" --silent 2> /dev/null; do
+      i=$((i + 1))
+      [ "$i" -lt 30 ] || die "the template copy did not finish within 60 s"
+      sleep 2
+    done
+    log "  created https://github.com/$OWNER/$name"
+  fi
 
   step "clone and fill placeholders"
-  mkdir -p "$dir"
-  gh repo clone "$OWNER/$name" "$target" -- --quiet
+  if [ -e "$target" ]; then
+    log "  already cloned at $target"
+  else
+    mkdir -p "$dir"
+    gh repo clone "$OWNER/$name" "$target" -- --quiet
+  fi
   fill_placeholders "$target" "$name" "$description"
   log "  ok"
 
   if [ "$stack" != none ]; then
     step "stack extras ($stack)"
-    for t in $(stack_gitignore "$stack"); do
-      {
-        printf '\n# --- %s (github/gitignore) ---\n' "$t"
-        gh api "gitignore/templates/$t" --jq .source
-      } >> "$target/.gitignore"
-    done
-    dependabot_block "$(stack_ecosystem "$stack")" >> "$target/.github/dependabot.yml"
+    add_stack_extras "$target" "$stack"
     log "  .gitignore: $(stack_gitignore "$stack"); dependabot: $(stack_ecosystem "$stack")"
   fi
 
   step "commit and push (before the rulesets exist)"
   branch=$(git -C "$target" symbolic-ref --short HEAD)
-  git -C "$target" add -A
-  git -C "$target" commit -q -m "chore: initialize from oss-template"
+  if [ -n "$(git -C "$target" status --porcelain)" ]; then
+    git -C "$target" add -A
+    git -C "$target" commit -q -m "chore: initialize from oss-template"
+  fi
   git -C "$target" push -q origin "HEAD:$branch"
   log "  pushed to $branch"
 
@@ -645,6 +687,16 @@ flow (docs/conventions.md in $KIT_REPO):
 EOF
 }
 
+NEW_HINT="" # set by new once the repository exists
+
+on_exit() {
+  local rc=$?
+  rm -rf "$WORK"
+  if [ "$rc" != 0 ] && [ -n "$NEW_HINT" ]; then
+    printf '\nnew stopped part-way; the repository exists. Finish it with:\n  %s\n' "$NEW_HINT" >&2
+  fi
+}
+
 main() {
   local cmd="${1:-}"
   [ $# -eq 0 ] || shift
@@ -652,7 +704,7 @@ main() {
     command -v "$tool" > /dev/null || die "$tool is required"
   done
   WORK=$(mktemp -d)
-  trap 'rm -rf "$WORK"' EXIT
+  trap on_exit EXIT
   case "$cmd" in
     new) cmd_new "$@" ;;
     apply) cmd_apply "$@" ;;
