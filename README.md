@@ -49,8 +49,13 @@ neither core nor a listed extension), `--skip-rulesets`, `--topics a,b`,
 Stacks: `node`, `java-maven`, `java-gradle`, `ruby`, `swift`, `python`, `go`,
 `elixir`, `none`.
 
-The CLI refuses private repositories and the name `.github`. It never
-changes whether a repository is a template.
+The CLI refuses private repositories, repositories not owned by `yutna` and
+the name `.github` (any letter case). It never changes whether a repository
+is a template. `--prune-labels` never deletes a label that
+`--migrate-labels` would rename; it reports it instead. The `main` ruleset is
+created only once the default branch has a `ci-ok` gate and a pr-check
+caller, so adopting an existing repository is: `apply --skip-rulesets`, merge
+the pull request that adds the oss-template files and callers, then `apply`.
 
 ## Reusable workflows
 
