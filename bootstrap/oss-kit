@@ -75,6 +75,7 @@ usage_error() {
 # label_plan CURRENT_JSON REPO MIGRATE(0|1) PRUNE(0|1)
 # Prints one operation per line, fields separated by $US:
 #   rename FROM TO | merge FROM TO | delete NAME | upsert NAME COLOR DESCRIPTION | prune NAME
+#   pending FROM TO (prune without migrate: left for --migrate-labels)
 label_plan() {
   jq -r --slurpfile core "$KIT_DIR/labels.json" --slurpfile mig "$KIT_DIR/label-migrations.json" \
     --arg repo "$2" --argjson migrate "$3" --argjson prune "$4" --arg us "$US" '
@@ -108,7 +109,14 @@ label_plan() {
           end)
     | if $prune == 1 then
         (([$core[].name] + ($mig.extensions[$repo] // [])) | map(lc)) as $keep
-        | .ops += [.labels[] | select((.name | lc) as $n | $keep | index($n) | not) | ["prune", .name]]
+        # Without --migrate-labels, a label a migration would rename is left
+        # alone (reported as pending), never pruned.
+        | (if $migrate == 1 then [] else $mig.rename end) as $renames
+        | .ops += [.labels[] | .name as $name
+            | ($renames | map(select((.from | lc) == ($name | lc))) | first) as $r
+            | if $r != null then ["pending", $name, $r.to]
+              elif ($keep | index($name | lc)) then empty
+              else ["prune", $name] end]
       else . end
     | .ops[] | join($us)
   ' "$1"
@@ -249,6 +257,8 @@ load_repo() {
   gh api "repos/$REPO" > "$REPO_JSON" || die "cannot read $REPO"
   [ "$(jq -r .visibility "$REPO_JSON")" = public ] ||
     die "$REPO is not public: oss-kit never touches private repositories"
+  [ "$(jq -r .owner.login "$REPO_JSON")" = "$OWNER" ] ||
+    die "$REPO is not owned by $OWNER: oss-kit only manages $OWNER's repositories"
   [ "$(jq -r .permissions.admin "$REPO_JSON")" = true ] || die "you are not an admin of $REPO"
   # GitHub's spelling, so per-repository extensions are found however it was typed.
   REPO=$(jq -r .full_name "$REPO_JSON")
@@ -339,9 +349,12 @@ check_security() {
 
 # Moves every issue and pull request labelled FROM to TO, then deletes FROM.
 label_merge() {
-  local n
-  for n in $(gh api -X GET "repos/$REPO/issues" -f labels="$1" -f state=all -f per_page=100 \
-    --paginate --jq '.[].number'); do
+  local nums n
+  # A failed listing must stop here: deleting the label would strip it from
+  # every item that was not moved.
+  nums=$(gh api -X GET "repos/$REPO/issues" -f labels="$1" -f state=all -f per_page=100 \
+    --paginate --jq '.[].number') || die "cannot list the items labelled \"$1\"; nothing was deleted"
+  for n in $nums; do
     gh api -X POST "repos/$REPO/issues/$n/labels" -f "labels[]=$2" --silent
   done
   gh label delete "$1" --yes -R "$REPO"
@@ -364,6 +377,13 @@ check_labels() {
       upsert) act "set label \"$a\" #$b \"$c\"" \
         gh label create "$a" --color "$b" --description "$c" --force -R "$REPO" ;;
       prune) act "delete label \"$a\" (not core, not an extension)" gh label delete "$a" --yes -R "$REPO" ;;
+      pending)
+        if [ "$MODE" = apply ]; then
+          warn "label \"$a\" left alone: run apply with --migrate-labels to turn it into \"$b\""
+        else
+          act "label \"$a\" needs --migrate-labels (-> \"$b\")" true
+        fi
+        ;;
     esac
   done 3< "$plan"
 }
@@ -397,7 +417,12 @@ check_rulesets() {
     name=$(jq -r .name "$spec")
     id=$(gh api "repos/$REPO/rulesets?includes_parents=false" |
       jq -r --arg n "$name" '[.[] | select(.name == $n and .source_type == "Repository")][0].id // empty')
-    if [ -z "$id" ]; then
+    if [ -z "$id" ] && [ "$name" = main ] && ! gate_ready; then
+      # Required checks that never report would lock main for good.
+      warn "skipped ruleset \"main\": the default branch of $REPO has no ci-ok gate or pr-check caller"
+      warn "  yet; merge the pull request that adds them, then run apply again"
+      [ "$MODE" = apply ] || DRIFT=$((DRIFT + 1))
+    elif [ -z "$id" ]; then
       act "create ruleset \"$name\"" gh api -X POST "repos/$REPO/rulesets" --input "$spec" --silent
     else
       gh api "repos/$REPO/rulesets/$id" > "$actual"
@@ -422,22 +447,38 @@ check_classic_protection() {
   fi
 }
 
+# Fetches the default branch's file list to $WORK/tree and its workflow files
+# to $WORK/workflows/, once per run.
+fetch_workflows() {
+  local branch path
+  [ ! -e "$WORK/tree" ] || return 0
+  branch=$(jq -r .default_branch "$REPO_JSON")
+  gh api "repos/$REPO/git/trees/$branch?recursive=1" \
+    --jq '.tree[] | select(.type == "blob") | .path' > "$WORK/tree"
+  mkdir -p "$WORK/workflows"
+  for path in $(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$WORK/tree" || true); do
+    gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/$path?ref=$branch" \
+      > "$WORK/workflows/$(basename "$path")"
+  done
+}
+
+# True when the default branch has a ci-ok gate job and a pr-check caller,
+# i.e. the checks the main ruleset requires will actually report.
+gate_ready() {
+  fetch_workflows
+  grep -qE '^  ci-ok:' "$WORK"/workflows/* 2> /dev/null &&
+    grep -qE "uses: *($KIT_REPO|\.)/\.github/workflows/pr-check\.yml" "$WORK"/workflows/* 2> /dev/null
+}
+
 check_files() {
   step "files"
-  local branch tree f wf path found clean=1
-  branch=$(jq -r .default_branch "$REPO_JSON")
-  tree="$WORK/tree"
-  gh api "repos/$REPO/git/trees/$branch?recursive=1" --jq '.tree[] | select(.type == "blob") | .path' > "$tree"
+  local f wf found clean=1
+  fetch_workflows
   for f in $REQUIRED_FILES; do
-    grep -qxF "$f" "$tree" || {
+    grep -qxF "$f" "$WORK/tree" || {
       clean=0
       act "missing file $f" true
     }
-  done
-  mkdir -p "$WORK/workflows"
-  for path in $(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$tree" || true); do
-    gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/$path?ref=$branch" \
-      > "$WORK/workflows/$(basename "$path")"
   done
   for wf in pr-check issue-check release; do
     found=$(grep -lE "uses: *($KIT_REPO|\.)/\.github/workflows/$wf\.yml" "$WORK"/workflows/* 2> /dev/null || true)
@@ -529,7 +570,7 @@ cmd_new() {
     shift
   done
   [ -n "$name" ] || usage_error "new: missing <name>"
-  [ "$name" != ".github" ] ||
+  [ "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" != ".github" ] ||
     die "never create $OWNER/.github: its community files would apply to private repositories too"
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || usage_error "new: invalid repository name \"$name\""
   [ -n "$description" ] || usage_error "new: --description is required"

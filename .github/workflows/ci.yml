@@ -50,8 +50,12 @@ jobs:
         run: |
           jq -e 'length == 13 and all(.[]; .color | test("^[0-9a-f]{6}$"))' bootstrap/labels.json
 
+  # macOS too: its /bin/bash is 3.2, the shell the CLI promises to support.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
         with:

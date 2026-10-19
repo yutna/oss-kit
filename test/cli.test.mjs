@@ -291,9 +291,9 @@ test('doctor refuses a private repository', () => {
 
 // A fake gh for a public repository that already matches the spec, plus the
 // extension label "area: app". Matching is case-insensitive, like GitHub.
-function compliantRepoGh(dir) {
+function compliantRepoGh(dir, extra = '') {
   const labels = JSON.stringify([...CORE, label('area: app', 'ededed', 'App')])
-  const repo = JSON.stringify({ ...GOOD_SETTINGS, full_name: 'yutna/ollama-bar', visibility: 'public',
+  const repo = JSON.stringify({ ...GOOD_SETTINGS, full_name: 'yutna/ollama-bar', owner: { login: 'yutna' }, visibility: 'public',
     default_branch: 'main', topics: [], permissions: { admin: true },
     security_and_analysis: { secret_scanning: { status: 'enabled' }, secret_scanning_push_protection: { status: 'enabled' } } })
   writeFileSync(join(dir, "repo.json"), repo)
@@ -309,6 +309,7 @@ case "$args" in
   "label list -r yutna/ollama-bar --limit 500 --json name,color,description") cat "${join(dir, "labels.json")}" ;;
   *"/milestones?state=all"*) printf 'v1.0.0\\037closed\\0371\\nBacklog\\037open\\0372\\nv1.1.0\\037open\\0373\\n' ;;
   *"/branches/main/protection --silent") exit 1 ;;
+${extra}
   *) echo "fake gh: unexpected call: $*" >&2; exit 99 ;;
 esac`)
 }
@@ -335,4 +336,59 @@ test('new refuses the name ".github"', () => {
   assert.notEqual(r.status, 0)
   assert.match(r.err, /\.github/)
   assert.ok(!readFileSync(join(d, 'gh.log'), 'utf8').includes('repo create'))
+})
+
+// --- safety (final review) --------------------------------------------------
+
+test('label_merge keeps the old label when listing its items fails', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `case "$*" in
+  *"/issues -f labels="*) printf '11\\n12\\n'; echo "HTTP 502" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac`)
+  const r = lib('REPO=yutna/x; label_merge feature enhancement', { env: { PATH: `${bin}:${process.env.PATH}` } })
+  assert.notEqual(r.status, 0)
+  assert.doesNotMatch(readFileSync(join(d, 'gh.log'), 'utf8'), /label delete/)
+})
+
+test('apply refuses a repository the owner does not own', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `echo '{"full_name":"friend/proj","owner":{"login":"friend"},"visibility":"public","permissions":{"admin":true}}'`)
+  const r = cli(['apply', 'friend/proj', '--dry-run'], { bin })
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /not owned by yutna/)
+  assert.equal(readFileSync(join(d, 'gh.log'), 'utf8').trim().split('\n').length, 1)
+})
+
+test('label_plan: prune without migrate leaves labels a migration would rename', () => {
+  const d = tmp()
+  const plan = rows(lib(`label_plan "${json(d, 'l.json', [...CORE, label('feature'), label('random-extra')])}" yutna/x 0 1`).out)
+  assert.ok(!plan.includes('prune|feature'), plan.join('\n'))
+  assert.ok(plan.includes('pending|feature|enhancement'), plan.join('\n'))
+  assert.ok(plan.includes('prune|random-extra'))
+})
+
+test('new refuses ".github" in any letter case', () => {
+  const d = tmp()
+  const bin = fakeGh(d, 'exit 0')
+  const r = cli(['new', '.GitHub', '--description', 'd', '--dir', d], { bin })
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /\.github/)
+  assert.ok(!readFileSync(join(d, 'gh.log'), 'utf8').includes('repo create'))
+})
+
+test('apply does not create the main ruleset before the repo has a ci-ok gate and a pr-check caller', () => {
+  const d = tmp()
+  const bin = compliantRepoGh(d, `  *"/rulesets?includes_parents=false") echo '[]' ;;
+  *"/git/trees/main?recursive=1"*) printf 'README.md\\n' ;;`)
+  const r = cli(['apply', 'yutna/ollama-bar', '--dry-run'], { bin })
+  assert.equal(r.status, 0, r.err)
+  assert.match(r.err, /skip(ped|ping) ruleset "main"/)
+  assert.doesNotMatch(r.err, /would: create ruleset "main"/)
+  assert.match(r.err, /would: create ruleset "release-tags"/)
+})
+
+test('CI runs the CLI tests on macOS, where /bin/bash is 3.2', () => {
+  const ci = readFileSync(fileURLToPath(new URL('../.github/workflows/ci.yml', import.meta.url)), 'utf8')
+  assert.match(ci, /macos-latest/)
 })
