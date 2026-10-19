@@ -80,6 +80,7 @@ jobs:
             // 2. Milestone: inherit an open version milestone from a linked issue;
             //    bots get the lowest open one. Never copy Backlog or a closed (released)
             //    milestone.
+            let lookupFailed = false
             const linkedIssues = async () => {
               const query = `query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
@@ -92,9 +93,17 @@ jobs:
               }`
               const retries = CLOSING.test(pr.body || '') ? 3 : 0
               for (let attempt = 0; ; attempt++) {
-                const result = await github.graphql(query, { owner, repo, number })
-                const nodes = result.repository.pullRequest.closingIssuesReferences.nodes
-                  .filter((n) => n.repository.nameWithOwner.toLowerCase() === `${owner}/${repo}`.toLowerCase())
+                let result
+                try {
+                  result = await github.graphql(query, { owner, repo, number })
+                } catch (error) {
+                  lookupFailed = true
+                  problems.push(`could not read the linked issues (${error.message}): re-run this check`)
+                  return []
+                }
+                // Issues the token cannot see come back as null nodes.
+                const nodes = (result?.repository?.pullRequest?.closingIssuesReferences?.nodes ?? [])
+                  .filter((n) => n?.repository?.nameWithOwner?.toLowerCase() === `${owner}/${repo}`.toLowerCase())
                 if (nodes.length > 0 || attempt >= retries) return nodes
                 core.info('no linked issue yet; GitHub can lag behind the body, retrying in 5 s')
                 await sleep(5000)
@@ -123,14 +132,15 @@ jobs:
 
             // 3. Labels: exactly one kind label from the title type, plus
             //    "breaking" when the title has "!". Other labels are left alone.
+            //    GitHub label names are case-insensitive, so match them that way.
             const title = TITLE.exec(pr.title)
             if (title) {
-              const have = new Set(pr.labels.map((l) => l.name))
+              const have = new Map(pr.labels.map((l) => [l.name.toLowerCase(), l.name]))
               const want = KIND[title[1]]
-              const remove = KIND_LABELS.filter((l) => l !== want && have.has(l))
+              const remove = KIND_LABELS.filter((l) => l !== want && have.has(l)).map((l) => have.get(l))
               const add = have.has(want) ? [] : [want]
               if (title[3] && !have.has('breaking')) add.push('breaking')
-              if (!title[3] && have.has('breaking')) remove.push('breaking')
+              if (!title[3] && have.has('breaking')) remove.push(have.get('breaking'))
               for (const name of remove) {
                 try {
                   await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name })
@@ -157,7 +167,7 @@ jobs:
                     ? `linked issue #${i.number} is in closed milestone "${i.milestone.title}": move issue #${i.number} to an open version milestone`
                     : `linked issue #${i.number} is in "${i.milestone.title}": move issue #${i.number} to a version milestone`)
                 }
-              } else if (!problems.some((p) => p.includes('create the next version milestone'))) {
+              } else if (!lookupFailed && !problems.some((p) => p.includes('create the next version milestone'))) {
                 problems.push('no milestone: add this pull request to a version milestone (vX.Y.Z), or link an issue that has one ("Closes #N")')
               }
             } else if (!isVersion(pr.milestone)) {
@@ -167,8 +177,11 @@ jobs:
             }
 
             if (problems.length > 0) {
+              // The summary renders markdown; problems quote the PR title, which
+              // anyone opening a pull request controls.
+              const md = (text) => text.replace(/[\\`*_{}[\]()#+\-.!|<>~]/g, '\\$&')
               await core.summary
-                .addRaw('### pr-check failed\n\n' + problems.map((p) => `- ${p}`).join('\n') + '\n')
+                .addRaw('### pr-check failed\n\n' + problems.map((p) => `- ${md(p)}`).join('\n') + '\n')
                 .write()
               // One line: GitHub shows only the first line of a failure annotation.
               core.setFailed(problems.join('; '))

@@ -66,7 +66,7 @@ Callers (already in oss-template):
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft,
-            assigned, unassigned, milestoned, demilestoned]
+            assigned, unassigned, milestoned, demilestoned, labeled, unlabeled]
 permissions: {}
 jobs:
   pr-check:
