@@ -35,7 +35,7 @@ function milestone(number, title) {
 
 // state: { pr, milestones, linked: [[...nodes], ...] } — `linked` is the
 // sequence of GraphQL answers; the last one repeats.
-async function run({ pr, milestones = [], linked = [[]] }) {
+async function run({ pr, milestones = [], linked = [[]], unassignable = [] }) {
   const state = structuredClone({ pr, milestones })
   state.pr.labels ??= []
   state.pr.assignees ??= []
@@ -55,8 +55,9 @@ async function run({ pr, milestones = [], linked = [[]] }) {
     issues: {
       addAssignees: async ({ assignees }) => {
         calls.push(['addAssignees', assignees])
-        for (const login of assignees) state.pr.assignees.push({ login })
-        return { data: {} }
+        // GitHub silently drops people it cannot assign (e.g. non-collaborators).
+        for (const login of assignees) if (!unassignable.includes(login)) state.pr.assignees.push({ login })
+        return { data: { assignees: structuredClone(state.pr.assignees) } }
       },
       update: async ({ milestone: number }) => {
         calls.push(['setMilestone', number])
@@ -123,7 +124,7 @@ const V020 = milestone(2, 'v0.2.0')
 const BACKLOG = milestone(3, 'Backlog')
 const issue = (number, ms, nameWithOwner = `${OWNER}/${REPO}`) => ({
   number,
-  milestone: ms ? { number: ms.number, title: ms.title } : null,
+  milestone: ms ? { number: ms.number, title: ms.title, state: ms.state.toUpperCase() } : null,
   repository: { nameWithOwner },
 })
 const good = (overrides = {}) => ({
@@ -346,4 +347,45 @@ test('pr-check never cancels a run in progress', () => {
   // and every run validates freshly read state, so runs may overlap.
   const workflow = readFileSync(WORKFLOW, 'utf8')
   assert.doesNotMatch(workflow, /cancel-in-progress:\s*true/)
+})
+
+// --- closed milestones and unassignable authors ----------------------------
+
+const V010_CLOSED = { number: 1, title: 'v0.1.0', state: 'closed' }
+
+test('does not inherit a closed version milestone from a linked issue', async () => {
+  const r = await run({
+    pr: good({ milestone: null, body: 'Fixes #3' }),
+    milestones: [V010_CLOSED, V020],
+    linked: [[issue(3, V010_CLOSED)]],
+  })
+  assert.equal(r.pr.milestone, null)
+  assert.equal(r.failed, true)
+  assert.match(r.message, /issue #3 is in closed milestone "v0\.1\.0"/)
+})
+
+test('fails a pull request in a closed version milestone', async () => {
+  const r = await run({ pr: good({ milestone: V010_CLOSED }), milestones: [V010_CLOSED] })
+  assert.equal(r.failed, true)
+  assert.match(r.message, /closed/)
+})
+
+test('replaces a closed pull request milestone with the linked issue open one', async () => {
+  const r = await run({
+    pr: good({ milestone: V010_CLOSED, body: 'Fixes #3' }),
+    milestones: [V010_CLOSED, V020],
+    linked: [[issue(3, V020)]],
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.2.0')
+  assert.equal(r.failed, false, r.message)
+})
+
+test('assigns the repository owner when the author cannot be assigned', async () => {
+  const r = await run({
+    pr: good({ assignees: [], user: { login: 'stranger', type: 'User' } }),
+    milestones: [V010],
+    unassignable: ['stranger'],
+  })
+  assert.deepEqual(r.pr.assignees.map((a) => a.login), [OWNER])
+  assert.equal(r.failed, false, r.message)
 })
