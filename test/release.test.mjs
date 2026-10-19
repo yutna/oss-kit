@@ -17,7 +17,8 @@ printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 case "$*" in
   "api repos/"*"/milestones/"*" --jq "*) echo "\${FAKE_STATE:-closed} \${FAKE_OPEN:-0}" ;;
   "api -X PATCH repos/"*"/milestones/"*" -f state=open --silent") ;;
-  "release view "*) [ -n "\${FAKE_RELEASE_EXISTS:-}" ] || { echo "release not found" >&2; exit 1; } ;;
+  "release view "*) [ -n "\${FAKE_RELEASE_EXISTS:-}" ] || { echo "release not found" >&2; exit 1; }
+    echo "\${FAKE_RELEASE_DRAFT:-false}" ;;
   "api repos/"*"/git/ref/tags/"*" --silent") [ -n "\${FAKE_TAG_EXISTS:-}" ] || { echo "HTTP 404" >&2; exit 1; } ;;
   "api repos/"*"/commits/"*" --jq .sha") echo "\${FAKE_SHA:-0123abc}" ;;
   "release create "*) ;;
@@ -155,4 +156,24 @@ test('release runs are never queued behind each other', () => {
   // A concurrency group lets GitHub cancel a pending run, which would drop a
   // release silently. Two runs for the same tag fail loudly on create instead.
   assert.doesNotMatch(readFileSync(WORKFLOW, 'utf8'), /^\s*concurrency:/m)
+})
+
+test('a draft release with the same tag reopens the milestone and fails', () => {
+  const r = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_RELEASE_EXISTS: '1', FAKE_RELEASE_DRAFT: 'true' })
+  assert.notEqual(r.status, 0)
+  assert.equal(reopened(r.calls), true)
+  assert.match(r.out, /::error::A draft release v1\.2\.0 exists/)
+})
+
+test('a re-run of a run whose release exists asks the caller to publish again', () => {
+  const rerun = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_RELEASE_EXISTS: '1', ATTEMPT: '2' })
+  assert.equal(rerun.status, 0, rerun.out)
+  assert.equal(rerun.outputs.go, 'false')
+  assert.equal(rerun.outputs.republish, 'true')
+  const first = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_RELEASE_EXISTS: '1', ATTEMPT: '1' })
+  assert.equal(first.outputs.republish, undefined)
+})
+
+test('the released output covers a re-run that publishes again', () => {
+  assert.match(readFileSync(WORKFLOW, 'utf8'), /released: \$\{\{ steps\.release\.outputs\.released \|\| steps\.decide\.outputs\.republish \|\| 'false' \}\}/)
 })
