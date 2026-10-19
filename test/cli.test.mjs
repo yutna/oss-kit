@@ -86,7 +86,7 @@ test('label_plan: migration renames, merges, deletes and keeps extensions', () =
   const plan = rows(r.out)
   const idx = (p) => plan.indexOf(p)
   assert.ok(idx('rename|feature|enhancement') >= 0, plan.join('\n'))
-  assert.ok(idx('merge|proposal|enhancement') > idx('rename|feature|enhancement'), 'proposal merges into the renamed label')
+  assert.ok(!plan.some((p) => p.includes('|proposal')), 'proposal is an extension here (D3), not renamed or pruned')
   assert.ok(idx('rename|breaking-change|breaking') >= 0)
   assert.ok(idx('delete|priority: medium') >= 0)
   assert.ok(idx('delete|wontfix') >= 0)
