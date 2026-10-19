@@ -37,7 +37,7 @@ gh api repos/yutna/<repo> > "$B/settings.json"
 gh label list -R yutna/<repo> --limit 500 --json name,color,description > "$B/labels.json"
 gh api "repos/yutna/<repo>/milestones?state=all&per_page=100" > "$B/milestones.json"
 gh api repos/yutna/<repo>/rulesets > "$B/rulesets.json"
-gh api repos/yutna/<repo>/branches/main/protection > "$B/protection.json" 2>&1
+gh api repos/yutna/<repo>/branches/<default-branch>/protection > "$B/protection.json" 2>&1
 ```
 
 ## 2. Open pull requests
@@ -109,7 +109,7 @@ runs the version on the base branch.
 
 ```sh
 # only if the repository had classic branch protection
-gh api -X DELETE repos/yutna/<repo>/branches/main/protection
+gh api -X DELETE repos/yutna/<repo>/branches/<default-branch>/protection
 bash bootstrap/oss-kit apply yutna/<repo>
 ```
 

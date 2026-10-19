@@ -67,6 +67,13 @@ touches other labels:
   caller's `release.yml` with `needs: release` and
   `if: needs.release.outputs.released == 'true'`, because a tag created by
   the workflow token does not trigger other workflows.
+- If `publish` fails, fix the cause and use **Re-run failed jobs** on that
+  run: it keeps the release job's outputs. "Re-run all jobs" finds the
+  release already made and skips publishing.
+- **After a release, create the next version milestone.** Until one is open,
+  Dependabot pull requests fail pr-check ("create the next version
+  milestone"). Creating it does not re-run their checks: re-run pr-check on
+  them, or edit them.
 - Release tags `v*` cannot be deleted or moved. To fix a bad tag, disable the
   `release-tags` ruleset temporarily.
 
