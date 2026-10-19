@@ -1,0 +1,11 @@
+name: Question
+description: Ask a question about using this project
+labels: [question]
+assignees: [yutna]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true

@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    labels: [dependencies]
+    assignees: [yutna]
+    commit-message:
+      prefix: chore
+      include: scope # -> "chore(deps): bump ...", which passes the PR title check
+  # stack ecosystems are appended here (npm, maven, bundler, swift, pip, gomod, mix, ...)

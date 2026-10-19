@@ -1,0 +1,120 @@
+name: release
+
+# Reusable. Callers trigger it on "milestone: closed". Closing a milestone
+# named vX.Y.Z at 100 % is the release; any other milestone is ignored, and a
+# milestone closed with open items is reopened and the run fails.
+#
+# A tag or release created with GITHUB_TOKEN does not trigger other workflows,
+# so publishing belongs in a job of the caller with
+#   needs: release
+#   if: needs.release.outputs.released == 'true'
+# checking out ref: ${{ needs.release.outputs.version }}.
+#
+# The run: blocks are exercised by test/release.test.mjs.
+on:
+  workflow_call:
+    inputs:
+      preflight:
+        description: >-
+          Shell command run on the commit about to be released, with VERSION
+          (1.2.0) and TAG (v1.2.0) set. Non-zero exit reopens the milestone
+          and fails. Use it to check that version files match the milestone.
+        type: string
+        required: false
+        default: ''
+    outputs:
+      released:
+        description: "'true' when this run created the release, else 'false'"
+        value: ${{ jobs.release.outputs.released }}
+      version:
+        description: The release tag, e.g. v1.2.0 (empty for non-version milestones)
+        value: ${{ jobs.release.outputs.version }}
+
+permissions: {}
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    outputs:
+      released: ${{ steps.release.outputs.released || 'false' }}
+      version: ${{ steps.decide.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      NUMBER: ${{ github.event.milestone.number }}
+    steps:
+      - name: Decide whether this milestone is a release
+        id: decide
+        env:
+          TAG: ${{ github.event.milestone.title }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::\"$TAG\" is not a release milestone (vX.Y.Z), skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Re-read the count: the event payload is a snapshot.
+          open=$(gh api "repos/$REPO/milestones/$NUMBER" --jq .open_issues)
+          if [ "$open" -gt 0 ]; then
+            gh api -X PATCH "repos/$REPO/milestones/$NUMBER" -f state=open --silent
+            echo "::error::Milestone still has $open open items; reopened"
+            exit 1
+          fi
+
+          # Idempotent: re-closing a released milestone, or a migrated repo
+          # whose old milestones match existing tags, does nothing.
+          if gh release view "$TAG" -R "$REPO" > /dev/null 2>&1 \
+            || gh api "repos/$REPO/git/ref/tags/$TAG" --silent 2> /dev/null; then
+            echo "::notice::$TAG is already released, skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Pin the commit so preflight checks exactly what gets tagged.
+          sha=$(gh api "repos/$REPO/commits/$BRANCH" --jq .sha)
+          {
+            echo "go=true"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the commit to release
+        if: steps.decide.outputs.go == 'true' && inputs.preflight != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.decide.outputs.sha }}
+          persist-credentials: false
+
+      - name: Preflight
+        id: preflight
+        if: steps.decide.outputs.go == 'true' && inputs.preflight != ''
+        env:
+          TAG: ${{ steps.decide.outputs.version }}
+          PREFLIGHT: ${{ inputs.preflight }}
+        run: |
+          VERSION="${TAG#v}"
+          export VERSION TAG
+          if ! bash -eo pipefail -c "$PREFLIGHT"; then
+            gh api -X PATCH "repos/$REPO/milestones/$NUMBER" -f state=open --silent
+            echo "::error::Preflight failed for $TAG; milestone reopened"
+            exit 1
+          fi
+
+      - name: Create the release
+        id: release
+        if: steps.decide.outputs.go == 'true'
+        env:
+          TAG: ${{ steps.decide.outputs.version }}
+          SHA: ${{ steps.decide.outputs.sha }}
+        run: |
+          gh release create "$TAG" -R "$REPO" --target "$SHA" --title "$TAG" --generate-notes
+          echo "released=true" >> "$GITHUB_OUTPUT"

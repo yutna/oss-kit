@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+# oss-kit — create public repositories and keep them on the shared workflow.
+# Conventions: docs/conventions.md. Tests: test/cli.test.mjs.
+#
+# Bash 3.2 compatible (macOS /bin/bash): no associative arrays, no mapfile,
+# no ${var,,}; empty arrays are never expanded under set -u. Depends only on
+# gh, git, jq and perl. Every step reads first and changes only what differs,
+# so running it twice changes nothing the second time.
+set -euo pipefail
+
+OWNER="${OSS_KIT_OWNER:-yutna}"
+FULLNAME="${OSS_KIT_FULLNAME:-Yutthana Siphuengchai}"
+TEMPLATE="$OWNER/oss-template"
+KIT_REPO="$OWNER/oss-kit"
+STACKS="node java-maven java-gradle ruby swift python go elixir none"
+US=$'\x1f' # field separator for plans: unlike a tab, it keeps empty fields
+
+DESIRED_SETTINGS='{
+  "has_issues": true, "has_wiki": false, "has_projects": false, "has_discussions": false,
+  "allow_squash_merge": true, "allow_merge_commit": false, "allow_rebase_merge": false,
+  "delete_branch_on_merge": true, "allow_auto_merge": true, "allow_update_branch": true,
+  "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "BLANK"
+}'
+
+REQUIRED_FILES="LICENSE README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md SUPPORT.md
+.editorconfig .gitattributes .github/pull_request_template.md .github/dependabot.yml
+.github/release.yml .github/ISSUE_TEMPLATE/config.yml .github/ISSUE_TEMPLATE/bug_report.yml
+.github/ISSUE_TEMPLATE/feature_request.yml .github/ISSUE_TEMPLATE/question.yml"
+
+# The bootstrap directory, also when the CLI is reached through a symlink.
+kit_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+KIT_DIR=$(kit_dir)
+
+usage() {
+  cat <<'EOF'
+usage: oss-kit new <name> --description "<text>" [--topics a,b,c] [--stack <stack>]
+                          [--dir ~/Projects] [--dry-run]
+       oss-kit apply <owner/repo> [--dry-run] [--migrate-labels] [--prune-labels]
+                          [--skip-rulesets] [--topics a,b,c] [--milestone vX.Y.Z]
+       oss-kit doctor <owner/repo>
+
+  new     create <owner>/<name> from oss-template, fill placeholders, add stack
+          extras, push, then apply.
+  apply   bring settings, security, labels, milestones and rulesets in line.
+  doctor  read-only: report drift from the spec; exit 1 when there is any.
+
+stacks: node java-maven java-gradle ruby swift python go elixir none
+Only public repositories are touched.
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+step() { printf '\n== %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+usage_error() {
+  printf 'error: %s\n\n' "$*" >&2
+  usage >&2
+  exit 2
+}
+
+# --- pure functions (tested) -------------------------------------------------
+
+# label_plan CURRENT_JSON REPO MIGRATE(0|1) PRUNE(0|1)
+# Prints one operation per line, fields separated by $US:
+#   rename FROM TO | merge FROM TO | delete NAME | upsert NAME COLOR DESCRIPTION | prune NAME
+label_plan() {
+  jq -r --slurpfile core "$KIT_DIR/labels.json" --slurpfile mig "$KIT_DIR/label-migrations.json" \
+    --arg repo "$2" --argjson migrate "$3" --argjson prune "$4" --arg us "$US" '
+    def lc: ascii_downcase;
+    def named($n): map(select(.name | lc == ($n | lc))) | first;
+    def exists($n): any(.[]; .name | lc == ($n | lc));
+    $core[0] as $core | $mig[0] as $mig
+    | { labels: ., ops: [] }
+    | if $migrate == 1 then
+        reduce $mig.rename[] as $r (.;
+          (.labels | named($r.from)) as $from
+          | if $from == null then .
+            elif (.labels | exists($r.to)) then
+              .ops += [["merge", $from.name, $r.to]]
+              | .labels |= map(select(.name | lc != ($r.from | lc)))
+            else
+              .ops += [["rename", $from.name, $r.to]]
+              | .labels |= map(if (.name | lc) == ($r.from | lc) then .name = $r.to else . end)
+            end)
+        | reduce $mig.delete[] as $d (.;
+            (.labels | named($d)) as $hit
+            | if $hit == null then .
+              else .ops += [["delete", $hit.name]] | .labels |= map(select(.name | lc != ($d | lc)))
+              end)
+      else . end
+    | reduce $core[] as $c (.;
+        (.labels | named($c.name)) as $have
+        | if $have != null and ($have.color | lc) == $c.color and ($have.description // "") == $c.description
+          then .
+          else .ops += [["upsert", $c.name, $c.color, $c.description]]
+          end)
+    | if $prune == 1 then
+        (([$core[].name] + ($mig.extensions[$repo] // [])) | map(lc)) as $keep
+        | .ops += [.labels[] | select((.name | lc) as $n | $keep | index($n) | not) | ["prune", .name]]
+      else . end
+    | .ops[] | join($us)
+  ' "$1"
+}
+
+# settings_drift REPO_JSON — prints "key<US>current<US>desired" per difference.
+settings_drift() {
+  jq -r --argjson want "$DESIRED_SETTINGS" --arg us "$US" '
+    . as $have | $want | to_entries[]
+    | select($have[.key] != .value)
+    | [.key, ($have[.key] | tostring), (.value | tostring)] | join($us)
+  ' "$1"
+}
+
+# json_subset SPEC_JSON ACTUAL_JSON — exit 0 when every value in the spec is
+# also in the actual object. Rules are compared by type, arrays as sets, and
+# keys GitHub adds (ids, links, new defaults) are ignored.
+json_subset() {
+  jq -e -n --slurpfile s "$1" --slurpfile a "$2" '
+    def norm:
+      (if type == "object" and has("rules")
+       then .rules |= (map({ key: .type, value: (.parameters // {}) }) | from_entries)
+       else . end)
+      | walk(if type == "array" then sort else . end);
+    def subset($a):
+      if type == "object"
+      then ($a | type) == "object" and all(to_entries[]; .key as $k | .value | subset($a[$k]))
+      else . == $a end;
+    ($s[0] | norm) | subset($a[0] | norm)
+  ' > /dev/null
+}
+
+# fill_placeholders DIR REPO DESCRIPTION — replaces {{YEAR}} {{OWNER}} {{REPO}}
+# {{DESCRIPTION}} {{FULLNAME}} in tracked files; fails if any {{UPPER}} is left.
+fill_placeholders() {
+  local dir="$1" files left
+  files=$(git -C "$dir" grep -lE '\{\{(YEAR|OWNER|REPO|DESCRIPTION|FULLNAME)\}\}' || true)
+  if [ -n "$files" ]; then
+    printf '%s\n' "$files" | while IFS= read -r f; do
+      OSK_YEAR=$(date +%Y) OSK_OWNER="$OWNER" OSK_REPO="$2" OSK_DESCRIPTION="$3" OSK_FULLNAME="$FULLNAME" \
+        perl -pi -e 's/\{\{YEAR\}\}/$ENV{OSK_YEAR}/g; s/\{\{OWNER\}\}/$ENV{OSK_OWNER}/g;
+          s/\{\{REPO\}\}/$ENV{OSK_REPO}/g; s/\{\{DESCRIPTION\}\}/$ENV{OSK_DESCRIPTION}/g;
+          s/\{\{FULLNAME\}\}/$ENV{OSK_FULLNAME}/g' "$dir/$f"
+    done
+  fi
+  left=$(git -C "$dir" grep -nE '\{\{[A-Z_]+\}\}' || true)
+  [ -z "$left" ] || die "placeholders left after filling: $left"
+}
+
+valid_stack() {
+  case " $STACKS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# gitignore template names (github/gitignore) for a stack, space-separated.
+stack_gitignore() {
+  case "$1" in
+    node) echo Node ;;
+    java-maven) echo "Java Maven" ;;
+    java-gradle) echo "Java Gradle" ;;
+    ruby) echo Ruby ;;
+    swift) echo Swift ;;
+    python) echo Python ;;
+    go) echo Go ;;
+    elixir) echo Elixir ;;
+    none) echo "" ;;
+    *) return 1 ;;
+  esac
+}
+
+stack_ecosystem() {
+  case "$1" in
+    node) echo npm ;;
+    java-maven) echo maven ;;
+    java-gradle) echo gradle ;;
+    ruby) echo bundler ;;
+    swift) echo swift ;;
+    python) echo pip ;;
+    go) echo gomod ;;
+    elixir) echo mix ;;
+    none) echo "" ;;
+    *) return 1 ;;
+  esac
+}
+
+# A Dependabot "updates" entry with the core conventions. Minor and patch
+# updates are grouped into one pull request; majors arrive one by one.
+dependabot_block() {
+  cat <<EOF
+  - package-ecosystem: $1
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      $1:
+        update-types: [minor, patch]
+    labels: [dependencies]
+    assignees: [$OWNER]
+    commit-message:
+      prefix: chore
+      include: scope
+EOF
+}
+
+# --- change or report ----------------------------------------------------------
+
+MODE="apply" # apply | dry-run | doctor
+DRIFT=0
+
+# act DESCRIPTION COMMAND... — runs COMMAND in apply mode; otherwise reports it.
+act() {
+  local what="$1"
+  shift
+  case "$MODE" in
+    apply)
+      log "  -> $what"
+      "$@"
+      ;;
+    dry-run)
+      log "  would: $what"
+      DRIFT=$((DRIFT + 1))
+      ;;
+    doctor)
+      log "  DRIFT: $what"
+      DRIFT=$((DRIFT + 1))
+      ;;
+  esac
+}
+
+# --- checks (each reads, then acts on the difference) -------------------------
+
+REPO=""
+REPO_JSON=""
+WORK=""
+
+load_repo() {
+  REPO="$1"
+  REPO_JSON="$WORK/repo.json"
+  gh api "repos/$REPO" > "$REPO_JSON" || die "cannot read $REPO"
+  [ "$(jq -r .visibility "$REPO_JSON")" = public ] ||
+    die "$REPO is not public: oss-kit never touches private repositories"
+  [ "$(jq -r .permissions.admin "$REPO_JSON")" = true ] || die "you are not an admin of $REPO"
+  # GitHub's spelling, so per-repository extensions are found however it was typed.
+  REPO=$(jq -r .full_name "$REPO_JSON")
+}
+
+check_settings() {
+  step "settings"
+  local drift summary="" key have want
+  drift=$(settings_drift "$REPO_JSON")
+  if [ -z "$drift" ]; then
+    log "  ok"
+    return
+  fi
+  while IFS="$US" read -r key have want; do
+    summary="$summary${summary:+, }$key $have->$want"
+  done <<< "$drift"
+  act "settings: $summary" gh api -X PATCH "repos/$REPO" --input - --silent <<< "$DESIRED_SETTINGS"
+}
+
+check_topics() {
+  local topics="$1" t missing=""
+  [ -n "$topics" ] || return 0
+  step "topics"
+  for t in $(printf '%s' "$topics" | tr ',' ' '); do
+    jq -e --arg t "$t" '.topics | index($t)' "$REPO_JSON" > /dev/null || missing="$missing $t"
+  done
+  if [ -z "$missing" ]; then
+    log "  ok"
+    return
+  fi
+  set -- # build --add-topic arguments without arrays
+  for t in $missing; do set -- "$@" --add-topic "$t"; done
+  act "add topics:$missing" gh repo edit "$REPO" "$@"
+}
+
+check_actions() {
+  step "actions"
+  local cur
+  cur=$(gh api "repos/$REPO/actions/permissions/workflow" \
+    --jq '"\(.default_workflow_permissions) \(.can_approve_pull_request_reviews)"')
+  if [ "$cur" = "read false" ]; then
+    log "  ok"
+    return
+  fi
+  act "default GITHUB_TOKEN permissions: $cur -> read false" \
+    gh api -X PUT "repos/$REPO/actions/permissions/workflow" \
+    -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false --silent
+}
+
+codeql_setup() {
+  gh api -X PATCH "repos/$1/code-scanning/default-setup" -f state=configured --silent ||
+    warn "CodeQL default setup failed (no supported language yet?); run apply again later"
+}
+
+check_security() {
+  step "security"
+  local clean=1 v ss pp
+  if ! gh api "repos/$REPO/vulnerability-alerts" --silent 2> /dev/null; then
+    clean=0
+    act "enable Dependabot alerts" gh api -X PUT "repos/$REPO/vulnerability-alerts" --silent
+  fi
+  v=$(gh api "repos/$REPO/automated-security-fixes" --jq .enabled 2> /dev/null || echo false)
+  if [ "$v" != true ]; then
+    clean=0
+    act "enable Dependabot security updates" gh api -X PUT "repos/$REPO/automated-security-fixes" --silent
+  fi
+  v=$(gh api "repos/$REPO/private-vulnerability-reporting" --jq .enabled 2> /dev/null || echo false)
+  if [ "$v" != true ]; then
+    clean=0
+    act "enable private vulnerability reporting" \
+      gh api -X PUT "repos/$REPO/private-vulnerability-reporting" --silent
+  fi
+  ss=$(jq -r '.security_and_analysis.secret_scanning.status // "unknown"' "$REPO_JSON")
+  pp=$(jq -r '.security_and_analysis.secret_scanning_push_protection.status // "unknown"' "$REPO_JSON")
+  if [ "$ss" != enabled ] || [ "$pp" != enabled ]; then
+    clean=0
+    act "secret scanning ($ss) and push protection ($pp) -> enabled" \
+      gh api -X PATCH "repos/$REPO" --input - --silent <<< \
+      '{"security_and_analysis":{"secret_scanning":{"status":"enabled"},"secret_scanning_push_protection":{"status":"enabled"}}}'
+  fi
+  v=$(gh api "repos/$REPO/code-scanning/default-setup" --jq .state 2> /dev/null || echo unknown)
+  if [ "$v" != configured ]; then
+    clean=0
+    act "CodeQL default setup ($v) -> configured" codeql_setup "$REPO"
+  fi
+  [ "$clean" = 0 ] || log "  ok"
+}
+
+# Moves every issue and pull request labelled FROM to TO, then deletes FROM.
+label_merge() {
+  local n
+  for n in $(gh api -X GET "repos/$REPO/issues" -f labels="$1" -f state=all -f per_page=100 \
+    --paginate --jq '.[].number'); do
+    gh api -X POST "repos/$REPO/issues/$n/labels" -f "labels[]=$2" --silent
+  done
+  gh label delete "$1" --yes -R "$REPO"
+}
+
+check_labels() {
+  step "labels"
+  local current="$WORK/labels.json" plan="$WORK/labels.plan" op a b c
+  gh label list -R "$REPO" --limit 500 --json name,color,description > "$current"
+  label_plan "$current" "$REPO" "$1" "$2" > "$plan"
+  if [ ! -s "$plan" ]; then
+    log "  ok"
+    return
+  fi
+  while IFS="$US" read -r -u 3 op a b c; do
+    case "$op" in
+      rename) act "rename label \"$a\" -> \"$b\"" gh label edit "$a" --name "$b" -R "$REPO" ;;
+      merge) act "move items labelled \"$a\" to \"$b\", delete \"$a\"" label_merge "$a" "$b" ;;
+      delete) act "delete label \"$a\" (migration)" gh label delete "$a" --yes -R "$REPO" ;;
+      upsert) act "set label \"$a\" #$b \"$c\"" \
+        gh label create "$a" --color "$b" --description "$c" --force -R "$REPO" ;;
+      prune) act "delete label \"$a\" (not core, not an extension)" gh label delete "$a" --yes -R "$REPO" ;;
+    esac
+  done 3< "$plan"
+}
+
+check_milestones() {
+  step "milestones"
+  local list="$WORK/milestones" extra="$1" clean=1 line
+  gh api "repos/$REPO/milestones?state=all&per_page=100" --paginate \
+    --jq '.[] | [.title, .state, (.number | tostring)] | join("\u001f")' > "$list"
+  line=$(grep -m1 "^Backlog$US" "$list" || true)
+  if [ -z "$line" ]; then
+    clean=0
+    act "create milestone Backlog" gh api -X POST "repos/$REPO/milestones" \
+      -f title=Backlog -f description="Parking lot. Never released." --silent
+  elif [ "$(printf '%s' "$line" | cut -d "$US" -f 2)" != open ]; then
+    clean=0
+    act "reopen milestone Backlog (it is never closed)" gh api -X PATCH \
+      "repos/$REPO/milestones/$(printf '%s' "$line" | cut -d "$US" -f 3)" -f state=open --silent
+  fi
+  if [ -n "$extra" ] && ! grep -q "^$extra$US" "$list"; then
+    clean=0
+    act "create milestone $extra" gh api -X POST "repos/$REPO/milestones" -f title="$extra" --silent
+  fi
+  [ "$clean" = 0 ] || log "  ok"
+}
+
+check_rulesets() {
+  step "rulesets"
+  local spec name id actual="$WORK/ruleset.json"
+  for spec in "$KIT_DIR/ruleset-main.json" "$KIT_DIR/ruleset-tags.json"; do
+    name=$(jq -r .name "$spec")
+    id=$(gh api "repos/$REPO/rulesets?includes_parents=false" |
+      jq -r --arg n "$name" '[.[] | select(.name == $n and .source_type == "Repository")][0].id // empty')
+    if [ -z "$id" ]; then
+      act "create ruleset \"$name\"" gh api -X POST "repos/$REPO/rulesets" --input "$spec" --silent
+    else
+      gh api "repos/$REPO/rulesets/$id" > "$actual"
+      if json_subset "$spec" "$actual"; then
+        log "  ok: $name"
+      else
+        act "update ruleset \"$name\" (#$id)" gh api -X PUT "repos/$REPO/rulesets/$id" --input "$spec" --silent
+      fi
+    fi
+  done
+}
+
+# Classic branch protection is replaced by the rulesets, but removing it is
+# left to a person (it is hard to reverse), so this only reports it.
+check_classic_protection() {
+  local branch
+  branch=$(jq -r .default_branch "$REPO_JSON")
+  if gh api "repos/$REPO/branches/$branch/protection" --silent 2> /dev/null; then
+    warn "$REPO has classic branch protection on $branch; remove it once the rulesets are in place:"
+    warn "  gh api -X DELETE repos/$REPO/branches/$branch/protection"
+    [ "$MODE" != doctor ] || DRIFT=$((DRIFT + 1))
+  fi
+}
+
+check_files() {
+  step "files"
+  local branch tree f wf path found clean=1
+  branch=$(jq -r .default_branch "$REPO_JSON")
+  tree="$WORK/tree"
+  gh api "repos/$REPO/git/trees/$branch?recursive=1" --jq '.tree[] | select(.type == "blob") | .path' > "$tree"
+  for f in $REQUIRED_FILES; do
+    grep -qxF "$f" "$tree" || {
+      clean=0
+      act "missing file $f" true
+    }
+  done
+  mkdir -p "$WORK/workflows"
+  for path in $(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$tree" || true); do
+    gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/$path?ref=$branch" \
+      > "$WORK/workflows/$(basename "$path")"
+  done
+  for wf in pr-check issue-check release; do
+    found=$(grep -lE "uses: *($KIT_REPO|\.)/\.github/workflows/$wf\.yml" "$WORK"/workflows/* 2> /dev/null || true)
+    [ -n "$found" ] || {
+      clean=0
+      act "no workflow calls $KIT_REPO/.github/workflows/$wf.yml" true
+    }
+  done
+  grep -qE '^  ci-ok:' "$WORK"/workflows/* 2> /dev/null || {
+    clean=0
+    act "no workflow has a ci-ok gate job" true
+  }
+  [ "$clean" = 0 ] || log "  ok"
+}
+
+# --- commands ------------------------------------------------------------------
+
+# apply_all MIGRATE PRUNE SKIP_RULESETS TOPICS MILESTONE
+apply_all() {
+  check_settings
+  check_topics "$4"
+  check_actions
+  check_security
+  check_labels "$1" "$2"
+  check_milestones "$5"
+  if [ "$3" = 1 ]; then
+    step "rulesets"
+    log "  skipped (--skip-rulesets)"
+  else
+    check_rulesets
+  fi
+  check_classic_protection
+}
+
+cmd_apply() {
+  local repo="" migrate=0 prune=0 skip=0 topics="" milestone=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) MODE="dry-run" ;;
+      --migrate-labels) migrate=1 ;;
+      --prune-labels) prune=1 ;;
+      --skip-rulesets) skip=1 ;;
+      --topics) topics="${2:?--topics needs a value}"; shift ;;
+      --milestone) milestone="${2:?--milestone needs a value}"; shift ;;
+      -*) usage_error "apply: unknown option $1" ;;
+      *) [ -z "$repo" ] || usage_error "apply: one repository at a time"; repo="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$repo" ] || usage_error "apply: missing <owner/repo>"
+  [ -z "$milestone" ] || [[ "$milestone" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    usage_error "--milestone must look like vX.Y.Z"
+  load_repo "$repo"
+  log "oss-kit apply $REPO ($MODE)"
+  apply_all "$migrate" "$prune" "$skip" "$topics" "$milestone"
+  if [ "$MODE" = dry-run ]; then
+    log ""
+    log "$DRIFT change(s) would be made"
+  fi
+}
+
+cmd_doctor() {
+  [ $# -eq 1 ] || usage_error "doctor: expected exactly one <owner/repo>"
+  MODE=doctor
+  load_repo "$1"
+  log "oss-kit doctor $REPO"
+  apply_all 0 1 0 "" ""
+  check_files
+  log ""
+  if [ "$DRIFT" -gt 0 ]; then
+    log "$DRIFT difference(s) from the spec"
+    return 1
+  fi
+  log "no drift"
+}
+
+cmd_new() {
+  local name="" description="" topics="" stack=none dir="$HOME/Projects" dry=0 target i branch t
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --description) description="${2:?--description needs a value}"; shift ;;
+      --topics) topics="${2:?--topics needs a value}"; shift ;;
+      --stack) stack="${2:?--stack needs a value}"; shift ;;
+      --dir) dir="${2:?--dir needs a value}"; shift ;;
+      --dry-run) dry=1 ;;
+      -*) usage_error "new: unknown option $1" ;;
+      *) [ -z "$name" ] || usage_error "new: one name at a time"; name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || usage_error "new: missing <name>"
+  [ "$name" != ".github" ] ||
+    die "never create $OWNER/.github: its community files would apply to private repositories too"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || usage_error "new: invalid repository name \"$name\""
+  [ -n "$description" ] || usage_error "new: --description is required"
+  valid_stack "$stack" || usage_error "new: unknown --stack \"$stack\" (one of: $STACKS)"
+  target="$dir/$name"
+
+  step "preflight"
+  [ "$(gh api user --jq .login)" = "$OWNER" ] || die "gh is not logged in as $OWNER"
+  ! gh api "repos/$OWNER/$name" --silent 2> /dev/null || die "$OWNER/$name already exists"
+  [ "$(gh api "repos/$TEMPLATE" --jq .is_template 2> /dev/null)" = true ] ||
+    die "$TEMPLATE is missing or not marked as a template"
+  [ ! -e "$target" ] || die "$target already exists"
+  log "  ok"
+  if [ "$dry" = 1 ]; then
+    log ""
+    log "would create $OWNER/$name (public) from $TEMPLATE, clone to $target,"
+    log "fill placeholders, add stack \"$stack\" extras, push, then apply with milestone v0.1.0"
+    return 0
+  fi
+
+  step "create $OWNER/$name"
+  gh repo create "$OWNER/$name" --public --template "$TEMPLATE" --description "$description" > /dev/null
+  i=0
+  until gh api "repos/$OWNER/$name/commits?per_page=1" --silent 2> /dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 30 ] || die "the template copy did not finish within 60 s"
+    sleep 2
+  done
+  log "  created https://github.com/$OWNER/$name"
+
+  step "clone and fill placeholders"
+  mkdir -p "$dir"
+  gh repo clone "$OWNER/$name" "$target" -- --quiet
+  fill_placeholders "$target" "$name" "$description"
+  log "  ok"
+
+  if [ "$stack" != none ]; then
+    step "stack extras ($stack)"
+    for t in $(stack_gitignore "$stack"); do
+      {
+        printf '\n# --- %s (github/gitignore) ---\n' "$t"
+        gh api "gitignore/templates/$t" --jq .source
+      } >> "$target/.gitignore"
+    done
+    dependabot_block "$(stack_ecosystem "$stack")" >> "$target/.github/dependabot.yml"
+    log "  .gitignore: $(stack_gitignore "$stack"); dependabot: $(stack_ecosystem "$stack")"
+  fi
+
+  step "commit and push (before the rulesets exist)"
+  branch=$(git -C "$target" symbolic-ref --short HEAD)
+  git -C "$target" add -A
+  git -C "$target" commit -q -m "chore: initialize from oss-template"
+  git -C "$target" push -q origin "HEAD:$branch"
+  log "  pushed to $branch"
+
+  MODE=apply
+  load_repo "$OWNER/$name"
+  apply_all 0 1 0 "$topics" v0.1.0
+
+  cat >&2 <<EOF
+
+Done: https://github.com/$OWNER/$name  (local: $target)
+Next: open the first issue in milestone v0.1.0 for the stack CI, then follow
+the draft-first flow (docs/conventions.md in $KIT_REPO):
+  gh issue create -R $OWNER/$name --title "ci: add $stack CI" --milestone v0.1.0
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  [ $# -eq 0 ] || shift
+  for tool in gh git jq perl; do
+    command -v "$tool" > /dev/null || die "$tool is required"
+  done
+  WORK=$(mktemp -d)
+  trap 'rm -rf "$WORK"' EXIT
+  case "$cmd" in
+    new) cmd_new "$@" ;;
+    apply) cmd_apply "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    -h | --help | help) usage ;;
+    "") usage_error "missing command" ;;
+    *) usage_error "unknown command \"$cmd\"" ;;
+  esac
+}
+
+if [ "${OSS_KIT_LIB:-}" != 1 ]; then
+  main "$@"
+fi

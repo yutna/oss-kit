@@ -1,0 +1,12 @@
+name: issue-check
+
+# Dogfooding: oss-kit calls its own reusable workflow by local path.
+on:
+  issues:
+    types: [opened]
+permissions: {}
+jobs:
+  issue-check:
+    uses: ./.github/workflows/issue-check.yml
+    permissions:
+      issues: write

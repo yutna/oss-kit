@@ -1,0 +1,15 @@
+[
+  { "name": "bug", "color": "d73a4a", "description": "Something isn't working" },
+  { "name": "enhancement", "color": "a2eeef", "description": "New feature or improvement" },
+  { "name": "documentation", "color": "0075ca", "description": "Documentation only" },
+  { "name": "chore", "color": "cfd3d7", "description": "Maintenance, refactoring, CI, build, tests" },
+  { "name": "security", "color": "ee0701", "description": "Security-related" },
+  { "name": "priority: high", "color": "d93f0b", "description": "Do this first" },
+  { "name": "priority: low", "color": "c2e0c6", "description": "Nice to have (no priority label = normal)" },
+  { "name": "blocked", "color": "fbca04", "description": "Waiting on something else" },
+  { "name": "breaking", "color": "b60205", "description": "Breaking change" },
+  { "name": "good first issue", "color": "7057ff", "description": "Good for newcomers" },
+  { "name": "help wanted", "color": "008672", "description": "Extra attention is welcome" },
+  { "name": "question", "color": "d876e3", "description": "Question or support request" },
+  { "name": "dependencies", "color": "0366d6", "description": "Dependency updates (Dependabot)" }
+]

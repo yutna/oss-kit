@@ -1,0 +1,13 @@
+name: release
+
+# Dogfooding: oss-kit calls its own reusable workflow by local path.
+on:
+  milestone:
+    types: [closed]
+permissions: {}
+jobs:
+  release:
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+      issues: write

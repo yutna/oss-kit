@@ -1,0 +1,32 @@
+name: issue-check
+
+# Reusable. Callers trigger it on "issues: opened". Every issue has an
+# assignee, so "Assigned to me" on github.com/issues works as a dashboard.
+# Issue forms already set one; this covers blank issues and the API.
+#
+# The script body is exercised by test/issue-check.test.mjs.
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo
+            const number = context.payload.issue.number
+            // Re-read: a form may have assigned someone after the event fired.
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: number })
+            if (issue.assignees.length > 0) {
+              core.info(`#${number} already assigned to ${issue.assignees.map((a) => a.login).join(', ')}`)
+              return
+            }
+            await github.rest.issues.addAssignees({ owner, repo, issue_number: number, assignees: [owner] })
+            core.info(`#${number} assigned to ${owner}`)

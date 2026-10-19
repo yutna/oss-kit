@@ -1,0 +1,73 @@
+name: ci
+
+# oss-kit's own CI. Every repository calls the reusable workflows here at
+# @main, so a change only merges after this passes. The test job runs the
+# changed pr-check / issue-check / release logic (read from the workflow
+# files) and the CLI under bash.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -s bash bootstrap/oss-kit
+
+  json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Every JSON file parses
+        run: |
+          git ls-files '*.json' | while IFS= read -r f; do jq empty "$f"; echo "ok $f"; done
+      - name: The core label set has 13 labels with 6-digit lower-case colours
+        run: |
+          jq -e 'length == 13 and all(.[]; .color | test("^[0-9a-f]{6}$"))' bootstrap/labels.json
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Workflow logic and CLI tests
+        run: |
+          node --version
+          node --test test/*.test.mjs
+
+  # ci-ok is the one required check: add every job above to its needs.
+  ci-ok:
+    if: always()
+    needs: [actionlint, shellcheck, json, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs passed
+        env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: test "$FAILED" = false

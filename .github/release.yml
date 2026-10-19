@@ -1,0 +1,22 @@
+# Release-note categories for generated notes. A pull request is listed under
+# the first category that matches. pr-check gives every pull request one of
+# enhancement / bug / documentation / chore, so the categories keyed on extra
+# labels (breaking, security, dependencies) must come before those.
+changelog:
+  categories:
+    - title: Breaking changes
+      labels: [breaking]
+    - title: Security
+      labels: [security]
+    - title: Features
+      labels: [enhancement]
+    - title: Bug fixes
+      labels: [bug]
+    - title: Documentation
+      labels: [documentation]
+    - title: Dependencies
+      labels: [dependencies]
+    - title: Maintenance
+      labels: [chore]
+    - title: Other changes
+      labels: ["*"]

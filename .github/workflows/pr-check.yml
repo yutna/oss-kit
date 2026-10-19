@@ -1,0 +1,160 @@
+name: pr-check
+
+# Reusable. Callers trigger it on pull_request_target (see docs/conventions.md)
+# so the token can write on pull requests from forks. It never checks out the
+# pull request's code: it only reads and writes through the API.
+#
+# One run fixes what it can (assignee, milestone, kind label) and then
+# validates the state it re-reads afterwards. Writes made with GITHUB_TOKEN do
+# not trigger another run, so the validation has to happen in this one.
+#
+# The script body is exercised by test/pr-check.test.mjs; keep it the only
+# "script: |" block in this file.
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    concurrency:
+      group: pr-check-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo
+            const number = context.payload.pull_request.number
+            const TITLE = /^(feat|fix|docs|chore|refactor|test|ci|build|perf|style|revert)(\([a-z0-9._/-]+\))?(!)?: \S.*$/
+            const VERSION = /^v(\d+)\.(\d+)\.(\d+)$/
+            const CLOSING = /\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b:?\s+(\S+\/\S+)?#\d+|\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b:?\s+https:\/\/github\.com\/\S+\/issues\/\d+/i
+            const KIND = {
+              feat: 'enhancement', perf: 'enhancement', fix: 'bug', docs: 'documentation',
+              chore: 'chore', refactor: 'chore', test: 'chore', ci: 'chore',
+              build: 'chore', style: 'chore', revert: 'chore',
+            }
+            const KIND_LABELS = ['enhancement', 'bug', 'documentation', 'chore']
+            const isVersion = (m) => Boolean(m && VERSION.test(m.title))
+            const semver = (title) => VERSION.exec(title).slice(1).map(Number)
+            const bySemver = (a, b) => {
+              const [x, y] = [semver(a.title), semver(b.title)]
+              return x[0] - y[0] || x[1] - y[1] || x[2] - y[2]
+            }
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+            const get = async () => (await github.rest.pulls.get({ owner, repo, pull_number: number })).data
+
+            let pr = await get()
+            const isBot = pr.user.type === 'Bot'
+            const problems = []
+
+            // 1. Assignee: the author, or the repository owner for bots.
+            if (pr.assignees.length === 0) {
+              const login = isBot ? owner : pr.user.login
+              try {
+                await github.rest.issues.addAssignees({ owner, repo, issue_number: number, assignees: [login] })
+                core.info(`assigned ${login}`)
+              } catch (error) {
+                core.warning(`could not assign ${login}: ${error.message}`)
+              }
+            }
+
+            // 2. Milestone: inherit from a linked issue; bots get the lowest
+            //    open version milestone. Never copy a non-version milestone.
+            const linkedIssues = async () => {
+              const query = `query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 10) {
+                      nodes { number milestone { number title } repository { nameWithOwner } }
+                    }
+                  }
+                }
+              }`
+              const retries = CLOSING.test(pr.body || '') ? 3 : 0
+              for (let attempt = 0; ; attempt++) {
+                const result = await github.graphql(query, { owner, repo, number })
+                const nodes = result.repository.pullRequest.closingIssuesReferences.nodes
+                  .filter((n) => n.repository.nameWithOwner.toLowerCase() === `${owner}/${repo}`.toLowerCase())
+                if (nodes.length > 0 || attempt >= retries) return nodes
+                core.info('no linked issue yet; GitHub can lag behind the body, retrying in 5 s')
+                await sleep(5000)
+              }
+            }
+
+            let linked = []
+            if (!isVersion(pr.milestone)) {
+              linked = await linkedIssues()
+              const target = linked.map((i) => i.milestone).filter(isVersion).sort(bySemver)[0]
+              if (target) {
+                await github.rest.issues.update({ owner, repo, issue_number: number, milestone: target.number })
+                core.info(`milestone set to ${target.title} from the linked issue`)
+              } else if (isBot) {
+                const open = await github.paginate(github.rest.issues.listMilestones,
+                  { owner, repo, state: 'open', per_page: 100 })
+                const next = open.filter(isVersion).sort(bySemver)[0]
+                if (next) {
+                  await github.rest.issues.update({ owner, repo, issue_number: number, milestone: next.number })
+                  core.info(`milestone set to ${next.title}, the lowest open version milestone`)
+                } else {
+                  problems.push('no open version milestone (vX.Y.Z) exists: create the next version milestone')
+                }
+              }
+            }
+
+            // 3. Labels: exactly one kind label from the title type, plus
+            //    "breaking" when the title has "!". Other labels are left alone.
+            const title = TITLE.exec(pr.title)
+            if (title) {
+              const have = new Set(pr.labels.map((l) => l.name))
+              const want = KIND[title[1]]
+              const remove = KIND_LABELS.filter((l) => l !== want && have.has(l))
+              const add = have.has(want) ? [] : [want]
+              if (title[3] && !have.has('breaking')) add.push('breaking')
+              if (!title[3] && have.has('breaking')) remove.push('breaking')
+              for (const name of remove) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name })
+                } catch (error) {
+                  if (error.status !== 404) throw error
+                }
+              }
+              if (add.length > 0) await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: add })
+            }
+
+            // 4. Validate the state as it is now, after the fixes above.
+            pr = await get()
+            if (!TITLE.test(pr.title)) {
+              problems.push(`title "${pr.title}" does not follow Conventional Commits: ` +
+                '"<type>(<scope>)!: <summary>" with type one of ' + Object.keys(KIND).join(', ') +
+                '; scope lower-case and optional; "!" marks a breaking change')
+            }
+            if (pr.assignees.length === 0) problems.push('no assignee: assign someone to this pull request')
+            if (!pr.milestone) {
+              const parked = linked.filter((i) => i.milestone && !isVersion(i.milestone))
+              if (parked.length > 0) {
+                for (const i of parked) problems.push(`linked issue #${i.number} is in "${i.milestone.title}": move issue #${i.number} to a version milestone`)
+              } else if (!problems.some((p) => p.includes('create the next version milestone'))) {
+                problems.push('no milestone: add this pull request to a version milestone (vX.Y.Z), or link an issue that has one ("Closes #N")')
+              }
+            } else if (!isVersion(pr.milestone)) {
+              problems.push(`milestone "${pr.milestone.title}" is not a release milestone: move this pull request (and its issue) to a version milestone (vX.Y.Z)`)
+            }
+
+            if (problems.length > 0) {
+              await core.summary
+                .addRaw('### pr-check failed\n\n' + problems.map((p) => `- ${p}`).join('\n') + '\n')
+                .write()
+              // One line: GitHub shows only the first line of a failure annotation.
+              core.setFailed(problems.join('; '))
+            } else {
+              const ms = pr.milestone.title
+              await core.summary.addRaw(`### pr-check passed\n\nTitle, assignee and milestone ${ms} are in order.\n`).write()
+              core.info(`pr-check passed (milestone ${ms})`)
+            }

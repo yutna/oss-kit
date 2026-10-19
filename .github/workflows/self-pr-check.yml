@@ -1,0 +1,17 @@
+name: pr-check
+
+# Dogfooding: oss-kit calls its own reusable workflows by local path, not
+# @main. (With pull_request_target the local path still resolves from the
+# base branch; the test job in ci.yml covers the changed logic.)
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft,
+            assigned, unassigned, milestoned, demilestoned]
+permissions: {}
+jobs:
+  pr-check:
+    uses: ./.github/workflows/pr-check.yml
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
