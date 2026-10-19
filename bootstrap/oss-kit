@@ -467,13 +467,17 @@ fetch_workflows() {
   local branch path
   [ ! -e "$WORK/tree" ] || return 0
   branch=$(jq -r .default_branch "$REPO_JSON")
+  # Callers test the result inside "if", where set -e is off: fail explicitly,
+  # and never leave a partial list behind for the next call to reuse.
   gh api "repos/$REPO/git/trees/$branch?recursive=1" \
-    --jq '.tree[] | select(.type == "blob") | .path' > "$WORK/tree"
+    --jq '.tree[] | select(.type == "blob") | .path' > "$WORK/tree.part" ||
+    die "cannot read the file list of $REPO; run it again"
   mkdir -p "$WORK/workflows"
-  for path in $(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$WORK/tree" || true); do
+  for path in $(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$WORK/tree.part" || true); do
     gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/$path?ref=$branch" \
-      > "$WORK/workflows/$(basename "$path")"
+      > "$WORK/workflows/$(basename "$path")" || die "cannot read $path from $REPO; run it again"
   done
+  mv "$WORK/tree.part" "$WORK/tree"
 }
 
 # True when the default branch has a ci-ok gate job and a pr-check caller,
@@ -626,26 +630,34 @@ cmd_new() {
   fi
 
   step "create $OWNER/$name"
-  # From here on a failure leaves a public repository behind; say how to finish it.
-  NEW_HINT="$(basename "$0") new $name --description $(printf '%q' "$description") --stack $stack"
-  [ -z "$topics" ] || NEW_HINT="$NEW_HINT --topics $topics"
-  NEW_HINT="$NEW_HINT --dir $(printf '%q' "$dir") --resume"
   if [ "$resume" = 1 ]; then
     log "  exists (resuming)"
   else
     gh repo create "$OWNER/$name" --public --template "$TEMPLATE" --description "$description" > /dev/null
-    i=0
-    until gh api "repos/$OWNER/$name/commits?per_page=1" --silent 2> /dev/null; do
-      i=$((i + 1))
-      [ "$i" -lt 30 ] || die "the template copy did not finish within 60 s"
-      sleep 2
-    done
-    log "  created https://github.com/$OWNER/$name"
   fi
+  # From here on a failure leaves a public repository behind; say how to finish it.
+  NEW_HINT="$(shq "$0") new $name --description $(shq "$description") --stack $stack"
+  [ -z "$topics" ] || NEW_HINT="$NEW_HINT --topics $(shq "$topics")"
+  NEW_HINT="$NEW_HINT --dir $(shq "$dir") --resume"
+  i=0
+  until gh api "repos/$OWNER/$name/commits?per_page=1" --silent 2> /dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 30 ] || die "the template copy did not finish within 60 s"
+    sleep 2
+  done
+  log "  https://github.com/$OWNER/$name"
 
   step "clone and fill placeholders"
+  # A clone made before the template copy finished has no commits; nothing
+  # in it can be anyone's work, so start that one over.
+  if [ -e "$target" ] && ! git -C "$target" rev-parse -q --verify HEAD > /dev/null &&
+    only_git_dir "$target"; then
+    log "  replacing the empty clone at $target"
+    rm -rf "$target"
+  fi
   if [ -e "$target" ]; then
     log "  already cloned at $target"
+    resume_check "$target"
   else
     mkdir -p "$dir"
     gh repo clone "$OWNER/$name" "$target" -- --quiet
@@ -683,8 +695,56 @@ next_steps() {
 Done: https://github.com/$1  (local: $2)
 Next: open the first issue in milestone v0.1.0, then follow the draft-first
 flow (docs/conventions.md in $KIT_REPO):
-  gh issue create -R $1 --title "$title" --milestone v0.1.0
+  gh issue create -R $1 --title "$title" --body "<what and why>" --milestone v0.1.0
 EOF
+}
+
+# only_git_dir DIR — true when DIR holds nothing but .git.
+only_git_dir() {
+  local f
+  for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = .git ] || return 1
+  done
+}
+
+# shq VALUE — VALUE single-quoted for a shell command line. Unlike printf %q
+# it leaves non-ASCII text readable, so a printed command can be copied.
+shq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# resume_check DIR — before new --resume publishes a clone it did not just
+# make, refuse anything oss-kit did not write: untracked files, changes to
+# files other than the ones it fills or extends, and local commits other than
+# its own initialization commit.
+resume_check() {
+  local dir="$1" branch allowed status line path stray="" commits
+  branch=$(git -C "$dir" symbolic-ref --short HEAD)
+  git -C "$dir" fetch -q origin
+  allowed=$(git -C "$dir" grep -lE '\{\{(YEAR|OWNER|REPO|DESCRIPTION|FULLNAME)\}\}' "origin/$branch" -- 2> /dev/null |
+    sed "s#^origin/$branch:##" || true)
+  allowed="$allowed
+.gitignore
+.github/dependabot.yml"
+  status=$(git -C "$dir" status --porcelain --untracked-files=all)
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path=${line:3}
+    case "$line" in
+      '??'*) stray="$stray
+  $path (untracked)" ;;
+      *) printf '%s\n' "$allowed" | grep -qxF "$path" || stray="$stray
+  $path" ;;
+    esac
+  done <<< "$status"
+  commits=$(git -C "$dir" log --format=%s "origin/$branch..HEAD")
+  if [ -n "$commits" ] && [ "$commits" != "chore: initialize from oss-template" ]; then
+    stray="$stray
+  local commits: $(printf '%s' "$commits" | tr '\n' ';')"
+  fi
+  [ -z "$stray" ] || die "--resume would publish work that oss-kit did not write in $dir:$stray
+Move it aside (or into a branch), then resume; your own work goes in through a pull request."
 }
 
 NEW_HINT="" # set by new once the repository exists

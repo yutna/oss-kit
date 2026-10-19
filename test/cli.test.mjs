@@ -18,7 +18,7 @@ function tmp() {
 }
 
 // Runs `snippet` after sourcing the CLI as a library.
-function lib(snippet, { env = {}, cwd } = {}) {
+function lib(snippet, { env = {}, cwd = tmp() } = {}) {
   const r = spawnSync(BASH, ['-c', `OSS_KIT_LIB=1 . "${CLI}" && ${snippet}`], {
     encoding: 'utf8', cwd, env: { ...process.env, ...env },
   })
@@ -229,7 +229,7 @@ test('dependabot_block follows the core conventions', () => {
 
 test('next_steps names the stack CI issue, and no stack for "none"', () => {
   const node = lib('next_steps yutna/my-lib /tmp/my-lib node').out
-  assert.match(node, /--title "ci: add node CI" --milestone v0\.1\.0/)
+  assert.match(node, /--title "ci: add node CI" --body "[^"]+" --milestone v0\.1\.0/)
   const none = lib('next_steps yutna/my-lib /tmp/my-lib none').out
   assert.doesNotMatch(none, /none CI/)
   assert.match(none, /--milestone v0\.1\.0/)
@@ -246,9 +246,10 @@ function fakeGh(dir, script) {
   return bin
 }
 
+// Runs in a throwaway directory, so nothing a test does can land in this repo.
 function cli(args, { bin } = {}) {
   const r = spawnSync(BASH, [CLI, ...args], {
-    encoding: 'utf8', env: { ...process.env, PATH: bin ? `${bin}:${process.env.PATH}` : process.env.PATH },
+    encoding: 'utf8', cwd: tmp(), env: { ...process.env, PATH: bin ? `${bin}:${process.env.PATH}` : process.env.PATH },
   })
   return { status: r.status, out: r.stdout, err: r.stderr }
 }
@@ -429,7 +430,7 @@ test('new prints the command to resume when it stops after creating the reposito
 esac`)
   const r = cli(['new', 'x', '--description', "it's new", '--dir', d], { bin })
   assert.notEqual(r.status, 0)
-  assert.match(r.err, /oss-kit new x --description .*--resume/)
+  assert.match(r.err, /oss-kit'? new x --description .*--resume/)
 })
 
 test('add_stack_extras is idempotent', () => {
@@ -460,4 +461,125 @@ test('a ci-ok job indented by four spaces counts as the gate', () => {
   const r = cli(['apply', 'yutna/ollama-bar', '--dry-run'], { bin })
   assert.equal(r.status, 0, r.err)
   assert.match(r.err, /would: create ruleset "main"/)
+})
+
+// --- new --resume safety (round 3) ------------------------------------------
+
+// A local "remote" with one template-like commit, cloned to <dir>/clone.
+function resumeFixture() {
+  const d = tmp()
+  const git = (args, cwd = d) => {
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } })
+    assert.equal(r.status, 0, r.stderr)
+    return r.stdout
+  }
+  const seed = join(d, 'seed')
+  mkdirSync(seed)
+  git(['init', '-q', '-b', 'main'], seed)
+  writeFileSync(join(seed, 'README.md'), '# {{REPO}}\n')
+  writeFileSync(join(seed, '.gitignore'), '.DS_Store\n')
+  git(['add', '-A'], seed)
+  git(['commit', '-q', '-m', 'Initial commit'], seed)
+  mkdirSync(join(d, 'remote/yutna'), { recursive: true })
+  const bare = join(d, 'remote/yutna/x.git')
+  git(['clone', '-q', '--bare', seed, bare])
+  git(['clone', '-q', bare, join(d, 'clone/x')])
+  const bin = fakeGh(d, `case "$*" in
+  "api user --jq .login") echo yutna ;;
+  "api repos/yutna/x") echo '{"full_name":"yutna/x","template_repository":{"full_name":"yutna/oss-template"}}' ;;
+  "api repos/yutna/x/commits?per_page=1 --silent") ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 99 ;;
+esac`)
+  const remoteCommits = () => git(['--git-dir', bare, 'rev-list', '--count', 'main']).trim()
+  return { d, bin, git, clone: join(d, 'clone/x'), remoteCommits }
+}
+
+const resume = (f) => cli(['new', 'x', '--description', 'd', '--dir', join(f.d, 'clone'), '--resume'], { bin: f.bin })
+
+test('new --resume refuses to publish untracked files', () => {
+  const f = resumeFixture()
+  writeFileSync(join(f.clone, 'config.local.json'), 'API_KEY=abc\n')
+  const r = resume(f)
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /config\.local\.json/)
+  assert.equal(f.remoteCommits(), '1')
+})
+
+test('new --resume refuses local commits of its own', () => {
+  const f = resumeFixture()
+  writeFileSync(join(f.clone, 'index.js'), 'work\n')
+  f.git(['add', '-A'], f.clone)
+  f.git(['commit', '-q', '-m', 'feat: work'], f.clone)
+  const r = resume(f)
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /feat: work/)
+  assert.equal(f.remoteCommits(), '1')
+})
+
+test('new --resume pushes its own unpushed initialization commit', () => {
+  const f = resumeFixture()
+  writeFileSync(join(f.clone, 'README.md'), '# x\n')
+  f.git(['commit', '-q', '-am', 'chore: initialize from oss-template'], f.clone)
+  resume(f) // apply then fails against the fake gh; the push is what matters
+  assert.equal(f.remoteCommits(), '2')
+})
+
+test('new --resume replaces an empty clone', () => {
+  const f = resumeFixture()
+  const empty = join(f.d, 'clone/x')
+  spawnSync('rm', ['-rf', empty])
+  mkdirSync(empty)
+  spawnSync('git', ['init', '-q'], { cwd: empty })
+  spawnSync('git', ['remote', 'add', 'origin', join(f.d, 'remote/yutna/x.git')], { cwd: empty })
+  const bin = fakeGh(f.d, `case "$*" in
+  "api user --jq .login") echo yutna ;;
+  "api repos/yutna/x") echo '{"full_name":"yutna/x","template_repository":{"full_name":"yutna/oss-template"}}' ;;
+  "api repos/yutna/x/commits?per_page=1 --silent") ;;
+  "repo clone yutna/x "*) git clone -q "${join(f.d, 'remote/yutna/x.git')}" "$4" ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 99 ;;
+esac`)
+  const r = cli(['new', 'x', '--description', 'd', '--dir', join(f.d, 'clone'), '--resume'], { bin })
+  assert.match(readFileSync(join(f.d, 'gh.log'), 'utf8'), /repo clone yutna\/x/, r.err)
+  assert.ok(existsSync(join(empty, 'README.md')))
+})
+
+test('the resume hint quotes values and keeps non-ASCII text as is', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `case "$*" in
+  "api user --jq .login") echo yutna ;;
+  "api repos/yutna/x --silent") exit 1 ;;
+  "api repos/yutna/oss-template --jq .is_template") echo true ;;
+  "repo create "*) ;;
+  "api repos/yutna/x/commits?per_page=1 --silent") ;;
+  "repo clone "*) exit 1 ;;
+  *) exit 99 ;;
+esac`)
+  const r = cli(['new', 'x', '--description', "เครื่องมือ it's", '--topics', 'cli, tools', '--dir', d], { bin })
+  assert.notEqual(r.status, 0)
+  assert.ok(r.err.includes(`--description 'เครื่องมือ it'\\''s'`), r.err)
+  assert.ok(r.err.includes(`--topics 'cli, tools'`), r.err)
+})
+
+test('no resume hint when the repository was never created', () => {
+  const d = tmp()
+  const bin = fakeGh(d, `case "$*" in
+  "api user --jq .login") echo yutna ;;
+  "api repos/yutna/x --silent") exit 1 ;;
+  "api repos/yutna/oss-template --jq .is_template") echo true ;;
+  "repo create "*) echo "HTTP 502" >&2; exit 1 ;;
+  *) exit 99 ;;
+esac`)
+  const r = cli(['new', 'x', '--description', 'd', '--dir', d], { bin })
+  assert.notEqual(r.status, 0)
+  assert.doesNotMatch(r.err, /--resume/)
+})
+
+test('a failed file-list fetch stops apply instead of reporting every file missing', () => {
+  const d = tmp()
+  const bin = compliantRepoGh(d, `  *"/rulesets?includes_parents=false") echo '[]' ;;
+  *"/git/trees/main?recursive=1"*) echo "HTTP 502" >&2; exit 1 ;;`)
+  const r = cli(['apply', 'yutna/ollama-bar', '--dry-run'], { bin })
+  assert.notEqual(r.status, 0)
+  assert.match(r.err, /cannot read the file list/)
 })
