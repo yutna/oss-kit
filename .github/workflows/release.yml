@@ -39,9 +39,6 @@ jobs:
     permissions:
       contents: write
       issues: write
-    concurrency:
-      group: release
-      cancel-in-progress: false
     outputs:
       released: ${{ steps.release.outputs.released || 'false' }}
       version: ${{ steps.decide.outputs.version }}
@@ -63,8 +60,16 @@ jobs:
           fi
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
-          # Re-read the count: the event payload is a snapshot.
-          open=$(gh api "repos/$REPO/milestones/$NUMBER" --jq .open_issues)
+          # Read the milestone live: the event payload is a snapshot, and a
+          # re-run of an old run must not release a milestone reopened since.
+          live=$(gh api "repos/$REPO/milestones/$NUMBER" --jq '"\(.state) \(.open_issues)"')
+          state=${live% *}
+          open=${live#* }
+          if [ "$state" != closed ]; then
+            echo "::notice::Milestone $TAG is open; close it to release"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$open" -gt 0 ]; then
             gh api -X PATCH "repos/$REPO/milestones/$NUMBER" -f state=open --silent
             echo "::error::Milestone still has $open open items; reopened"
@@ -103,7 +108,8 @@ jobs:
         run: |
           VERSION="${TAG#v}"
           export VERSION TAG
-          if ! bash -eo pipefail -c "$PREFLIGHT"; then
+          # Repository code runs here (npm ci, scripts): keep the token out of it.
+          if ! env -u GH_TOKEN -u GITHUB_TOKEN bash -eo pipefail -c "$PREFLIGHT"; then
             gh api -X PATCH "repos/$REPO/milestones/$NUMBER" -f state=open --silent
             echo "::error::Preflight failed for $TAG; milestone reopened"
             exit 1
