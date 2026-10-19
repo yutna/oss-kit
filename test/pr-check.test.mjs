@@ -336,3 +336,14 @@ test('reports every problem in one failure and in the step summary', async () =>
   assert.match(r.message, /milestone/)
   assert.match(r.summary, /Conventional Commits/)
 })
+
+// --- workflow shape ---------------------------------------------------------
+
+test('pr-check never cancels a run in progress', () => {
+  // Two events at once start two runs. A cancelled run can be the one in the
+  // newer check suite, and GitHub then reports the required check as
+  // cancelled although the other run passed. Every write here is idempotent
+  // and every run validates freshly read state, so runs may overlap.
+  const workflow = readFileSync(WORKFLOW, 'utf8')
+  assert.doesNotMatch(workflow, /cancel-in-progress:\s*true/)
+})

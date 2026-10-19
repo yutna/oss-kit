@@ -23,9 +23,11 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    concurrency:
-      group: pr-check-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
+    # No concurrency group: two events at once (a push and "ready for review")
+    # start two runs, and a cancelled run can sit in the newer check suite,
+    # which GitHub then reports as the required check's result. Every write
+    # below is idempotent and every run validates freshly read state, so
+    # overlapping runs agree.
     steps:
       - uses: actions/github-script@v9
         with:
