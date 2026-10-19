@@ -35,7 +35,8 @@ function milestone(number, title) {
 
 // state: { pr, milestones, linked: [[...nodes], ...] } — `linked` is the
 // sequence of GraphQL answers; the last one repeats.
-async function run({ pr, milestones = [], linked = [[]], unassignable = [], graphqlError = null }) {
+async function run({ pr, milestones = [], linked = [[]], unassignable = [], graphqlError = null,
+  graphqlPartial = null, serverErrorOn = [], serverErrorApplies = true }) {
   const state = structuredClone({ pr, milestones })
   state.pr.labels ??= []
   state.pr.assignees ??= []
@@ -47,6 +48,13 @@ async function run({ pr, milestones = [], linked = [[]], unassignable = [], grap
   let graphqlCalls = 0
   const failures = []
   const summary = []
+  // A 500 after (or instead of) the change: what GitHub does when two runs
+  // write the same thing at once.
+  const maybe500 = (name, apply) => {
+    if (!serverErrorOn.includes(name)) return apply()
+    if (serverErrorApplies) apply()
+    throw Object.assign(new Error(`Server Error (${name})`), { status: 500 })
+  }
 
   const rest = {
     pulls: {
@@ -56,19 +64,25 @@ async function run({ pr, milestones = [], linked = [[]], unassignable = [], grap
       addAssignees: async ({ assignees }) => {
         calls.push(['addAssignees', assignees])
         // GitHub silently drops people it cannot assign (e.g. non-collaborators).
-        for (const login of assignees) if (!unassignable.includes(login)) state.pr.assignees.push({ login })
+        maybe500('addAssignees', () => {
+          for (const login of assignees) if (!unassignable.includes(login)) state.pr.assignees.push({ login })
+        })
         return { data: { assignees: structuredClone(state.pr.assignees) } }
       },
       update: async ({ milestone: number }) => {
         calls.push(['setMilestone', number])
-        state.pr.milestone = state.milestones.find((m) => m.number === number) ?? null
+        maybe500('setMilestone', () => {
+          state.pr.milestone = state.milestones.find((m) => m.number === number) ?? null
+        })
         return { data: {} }
       },
       addLabels: async ({ labels }) => {
         calls.push(['addLabels', labels])
-        for (const name of labels) {
-          if (!state.pr.labels.some((l) => l.name === name)) state.pr.labels.push({ name })
-        }
+        maybe500('addLabels', () => {
+          for (const name of labels) {
+            if (!state.pr.labels.some((l) => l.name === name)) state.pr.labels.push({ name })
+          }
+        })
         return { data: [] }
       },
       removeLabel: async ({ name }) => {
@@ -84,6 +98,11 @@ async function run({ pr, milestones = [], linked = [[]], unassignable = [], grap
     paginate: async (fn, params) => (await fn(params)).data,
     graphql: async () => {
       if (graphqlError) throw new Error(graphqlError)
+      if (graphqlPartial) {
+        throw Object.assign(new Error('Could not resolve to an Issue'), {
+          data: { repository: { pullRequest: { closingIssuesReferences: { nodes: graphqlPartial } } } },
+        })
+      }
       const nodes = linked[Math.min(graphqlCalls, linked.length - 1)]
       graphqlCalls += 1
       return { repository: { pullRequest: { closingIssuesReferences: { nodes } } } }
@@ -433,4 +452,62 @@ test('the caller re-checks a pull request when its labels change', () => {
   const caller = readFileSync(fileURLToPath(new URL('../.github/workflows/self-pr-check.yml', import.meta.url)), 'utf8')
   assert.match(caller, /\blabeled\b/)
   assert.match(caller, /\bunlabeled\b/)
+})
+
+// --- concurrent runs, closed PRs, partial errors (round 3) -------------------
+
+test('a server error on a write does not fail the run when the state ends up right', async () => {
+  const r = await run({
+    pr: good({ milestone: null, body: 'Closes #3', labels: [] }),
+    milestones: [V010],
+    linked: [[issue(3, V010)]],
+    serverErrorOn: ['setMilestone', 'addLabels'],
+  })
+  assert.equal(r.failed, false, r.message)
+  assert.equal(r.pr.milestone?.title, 'v0.1.0')
+})
+
+test('a server error that left the state wrong is reported, not thrown', async () => {
+  const r = await run({
+    pr: good({ milestone: null, body: 'Closes #3' }),
+    milestones: [V010],
+    linked: [[issue(3, V010)]],
+    serverErrorOn: ['setMilestone'],
+    serverErrorApplies: false,
+  })
+  assert.equal(r.failed, true)
+  assert.match(r.message, /milestone/)
+})
+
+test('skips a closed or merged pull request', async () => {
+  const r = await run({
+    pr: good({ state: 'closed', title: 'update stuff', assignees: [], milestone: null }),
+    milestones: [V010],
+  })
+  assert.equal(r.failed, false, r.message)
+  assert.deepEqual(r.calls, [])
+})
+
+test('a bot pull request passes once the fallback set its milestone, even if the linked-issue lookup failed', async () => {
+  const r = await run({
+    pr: good({ milestone: null, user: { login: 'dependabot[bot]', type: 'Bot' }, title: 'chore(deps): bump x' }),
+    milestones: [V010],
+    graphqlError: 'Something went wrong',
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.1.0')
+  assert.equal(r.failed, false, r.message)
+})
+
+test('uses the partial data of a GraphQL error', async () => {
+  const r = await run({
+    pr: good({ milestone: null, body: 'Closes #3' }),
+    milestones: [V010, V020],
+    graphqlPartial: [null, issue(3, V020)],
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.2.0')
+  assert.equal(r.failed, false, r.message)
+})
+
+test('the github-script step retries server errors', () => {
+  assert.match(readFileSync(WORKFLOW, 'utf8'), /^\s+retries: 3$/m)
 })

@@ -26,11 +26,13 @@ jobs:
     # No concurrency group: two events at once (a push and "ready for review")
     # start two runs, and a cancelled run can sit in the newer check suite,
     # which GitHub then reports as the required check's result. Every write
-    # below is idempotent and every run validates freshly read state, so
-    # overlapping runs agree.
+    # below is idempotent, tolerates the server errors concurrent writes can
+    # cause, and every run validates freshly read state, so overlapping runs
+    # agree.
     steps:
       - uses: actions/github-script@v9
         with:
+          retries: 3
           script: |
             const { owner, repo } = context.repo
             const number = context.payload.pull_request.number
@@ -54,8 +56,26 @@ jobs:
             }
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
             const get = async () => (await github.rest.pulls.get({ owner, repo, pull_number: number })).data
+            // Runs started together (opened + assigned + labeled) write the same
+            // things at once, and GitHub may answer one of them with a server
+            // error although the change landed. Note it and carry on: the
+            // validation below reads the state back and judges that.
+            const write = async (what, fn) => {
+              try {
+                return await fn()
+              } catch (error) {
+                if (!(error.status >= 500)) throw error
+                core.warning(`${what}: ${error.message}; checking the result instead`)
+                return null
+              }
+            }
 
             let pr = await get()
+            // Label events also fire on closed and merged pull requests; leave them be.
+            if (pr.state === 'closed') {
+              core.info(`#${number} is closed; nothing to check`)
+              return
+            }
             const isBot = pr.user.type === 'Bot'
             const problems = []
 
@@ -81,6 +101,7 @@ jobs:
             //    bots get the lowest open one. Never copy Backlog or a closed (released)
             //    milestone.
             let lookupFailed = false
+            let lookupProblem = null
             const linkedIssues = async () => {
               const query = `query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
@@ -97,9 +118,14 @@ jobs:
                 try {
                   result = await github.graphql(query, { owner, repo, number })
                 } catch (error) {
-                  lookupFailed = true
-                  problems.push(`could not read the linked issues (${error.message}): re-run this check`)
-                  return []
+                  // An issue the token cannot see is an error with partial data.
+                  if (error.data?.repository) {
+                    result = error.data
+                  } else {
+                    lookupFailed = true
+                    lookupProblem = `could not read the linked issues (${error.message}): re-run this check`
+                    return []
+                  }
                 }
                 // Issues the token cannot see come back as null nodes.
                 const nodes = (result?.repository?.pullRequest?.closingIssuesReferences?.nodes ?? [])
@@ -115,14 +141,14 @@ jobs:
               linked = await linkedIssues()
               const target = linked.map((i) => i.milestone).filter(isOpenVersion).sort(bySemver)[0]
               if (target) {
-                await github.rest.issues.update({ owner, repo, issue_number: number, milestone: target.number })
+                await write('set milestone', () => github.rest.issues.update({ owner, repo, issue_number: number, milestone: target.number }))
                 core.info(`milestone set to ${target.title} from the linked issue`)
               } else if (isBot) {
                 const open = await github.paginate(github.rest.issues.listMilestones,
                   { owner, repo, state: 'open', per_page: 100 })
                 const next = open.filter(isVersion).sort(bySemver)[0]
                 if (next) {
-                  await github.rest.issues.update({ owner, repo, issue_number: number, milestone: next.number })
+                  await write('set milestone', () => github.rest.issues.update({ owner, repo, issue_number: number, milestone: next.number }))
                   core.info(`milestone set to ${next.title}, the lowest open version milestone`)
                 } else {
                   problems.push('no open version milestone (vX.Y.Z) exists: create the next version milestone')
@@ -145,10 +171,12 @@ jobs:
                 try {
                   await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name })
                 } catch (error) {
-                  if (error.status !== 404) throw error
+                  if (error.status !== 404 && !(error.status >= 500)) throw error
                 }
               }
-              if (add.length > 0) await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: add })
+              if (add.length > 0) {
+                await write('add labels', () => github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: add }))
+              }
             }
 
             // 4. Validate the state as it is now, after the fixes above.
@@ -175,6 +203,8 @@ jobs:
             } else if (!isOpen(pr.milestone)) {
               problems.push(`milestone "${pr.milestone.title}" is closed (already released): move this pull request (and its issue) to an open version milestone`)
             }
+            // A failed lookup matters only while the milestone is still not right.
+            if (lookupProblem && !isOpenVersion(pr.milestone)) problems.push(lookupProblem)
 
             if (problems.length > 0) {
               // The summary renders markdown; problems quote the PR title, which
