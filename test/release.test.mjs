@@ -15,7 +15,7 @@ const step = (id) => block(WORKFLOW, 'run', new RegExp(`^\\s*(- )?id: ${id}\\s*$
 const FAKE_GH = `#!/bin/bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 case "$*" in
-  "api repos/"*"/milestones/"*" --jq .open_issues") echo "\${FAKE_OPEN:-0}" ;;
+  "api repos/"*"/milestones/"*" --jq "*) echo "\${FAKE_STATE:-closed} \${FAKE_OPEN:-0}" ;;
   "api -X PATCH repos/"*"/milestones/"*" -f state=open --silent") ;;
   "release view "*) [ -n "\${FAKE_RELEASE_EXISTS:-}" ] || { echo "release not found" >&2; exit 1; } ;;
   "api repos/"*"/git/ref/tags/"*" --silent") [ -n "\${FAKE_TAG_EXISTS:-}" ] || { echo "HTTP 404" >&2; exit 1; } ;;
@@ -125,4 +125,34 @@ test('creates the release at the pinned commit with generated notes', () => {
   assert.equal(r.status, 0, r.out)
   assert.ok(r.calls.includes('gh release create v1.2.0 -R yutna/sandbox --target feedbeef --title v1.2.0 --generate-notes'), r.calls.join('\n'))
   assert.equal(r.outputs.released, 'true')
+})
+
+test('skips a milestone that is open again, e.g. a re-run after it was reopened', () => {
+  const r = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_STATE: 'open' })
+  assert.equal(r.status, 0, r.out)
+  assert.equal(r.outputs.go, 'false')
+  assert.match(r.out, /is open/)
+  assert.equal(reopened(r.calls), false)
+})
+
+test('preflight runs without the GitHub token', () => {
+  const dir = sandbox()
+  const r = runStep(dir, 'preflight', {
+    TAG: 'v1.2.0', GH_TOKEN: 'secret', FAKE_SEEN: join(dir, 'seen'),
+    PREFLIGHT: 'printf "%s" "${GH_TOKEN:-unset}" > "$FAKE_SEEN"',
+  })
+  assert.equal(r.status, 0, r.out)
+  assert.equal(readFileSync(join(dir, 'seen'), 'utf8'), 'unset')
+})
+
+test('a failing preflight still reopens the milestone with the token', () => {
+  const r = runStep(sandbox(), 'preflight', { TAG: 'v1.2.0', GH_TOKEN: 'secret', PREFLIGHT: 'false' })
+  assert.notEqual(r.status, 0)
+  assert.equal(reopened(r.calls), true)
+})
+
+test('release runs are never queued behind each other', () => {
+  // A concurrency group lets GitHub cancel a pending run, which would drop a
+  // release silently. Two runs for the same tag fail loudly on create instead.
+  assert.doesNotMatch(readFileSync(WORKFLOW, 'utf8'), /^\s*concurrency:/m)
 })
