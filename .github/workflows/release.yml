@@ -9,6 +9,8 @@ name: release
 #   needs: release
 #   if: needs.release.outputs.released == 'true'
 # checking out ref: ${{ needs.release.outputs.version }}.
+# If publish fails, use "Re-run failed jobs": it keeps the release job's
+# outputs. "Re-run all jobs" finds the release already made and skips.
 #
 # The run: blocks are exercised by test/release.test.mjs.
 on:
@@ -24,7 +26,7 @@ on:
         default: ''
     outputs:
       released:
-        description: "'true' when this run created the release, or is a re-run of the run that did; else 'false'"
+        description: "'true' when this run created the release, else 'false'"
         value: ${{ jobs.release.outputs.released }}
       version:
         description: The release tag, e.g. v1.2.0 (empty for non-version milestones)
@@ -40,7 +42,7 @@ jobs:
       contents: write
       issues: write
     outputs:
-      released: ${{ steps.release.outputs.released || steps.decide.outputs.republish || 'false' }}
+      released: ${{ steps.release.outputs.released || 'false' }}
       version: ${{ steps.decide.outputs.version }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -62,10 +64,18 @@ jobs:
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
           # Read the milestone live: the event payload is a snapshot, and a
-          # re-run of an old run must not release a milestone reopened since.
-          live=$(gh api "repos/$REPO/milestones/$NUMBER" --jq '"\(.state) \(.open_issues)"')
-          state=${live% *}
-          open=${live#* }
+          # re-run of an old run must not release a milestone reopened or
+          # renamed since (a wrong tag could never be deleted).
+          live=$(gh api "repos/$REPO/milestones/$NUMBER" --jq '"\(.state) \(.open_issues) \(.title)"')
+          state=${live%% *}
+          rest=${live#* }
+          open=${rest%% *}
+          title=${rest#* }
+          if [ "$title" != "$TAG" ]; then
+            echo "::notice::Milestone $TAG was renamed to \"$title\" since this run started; skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$state" != closed ]; then
             echo "::notice::Milestone $TAG is open; close it to release"
             echo "go=false" >> "$GITHUB_OUTPUT"
@@ -81,7 +91,15 @@ jobs:
           # whose old milestones match existing tags, does nothing.
           # A draft with this tag was made by hand; publishing or deleting it
           # is a person's call, so stop instead of skipping silently.
-          draft=$(gh release view "$TAG" -R "$REPO" --json isDraft --jq .isDraft 2> /dev/null || echo none)
+          if ! draft=$(gh release view "$TAG" -R "$REPO" --json isDraft --jq .isDraft 2>&1); then
+            case "$draft" in
+              *"release not found"*) draft=none ;;
+              *)
+                echo "::error::Could not check for an existing release $TAG ($draft); re-run this workflow"
+                exit 1
+                ;;
+            esac
+          fi
           if [ "$draft" = true ]; then
             gh api -X PATCH "repos/$REPO/milestones/$NUMBER" -f state=open --silent
             echo "::error::A draft release $TAG exists: publish or delete it, then close the milestone again; reopened"
@@ -89,10 +107,10 @@ jobs:
           fi
           if [ "$draft" = false ] || gh api "repos/$REPO/git/ref/tags/$TAG" --silent 2> /dev/null; then
             if [ "${ATTEMPT:-1}" -gt 1 ]; then
-              # "Re-run all jobs" after a failed publish: the first attempt
-              # made the release, so let the caller's publish job run again.
-              echo "::notice::$TAG already exists and this is a re-run: publishing again"
-              echo "republish=true" >> "$GITHUB_OUTPUT"
+              # Never publish from here: the release may be an old tag or the
+              # work of another run. "Re-run failed jobs" keeps the outputs of
+              # the release job that made it, so publish runs again correctly.
+              echo "::notice::$TAG already exists; to publish it again, use \"Re-run failed jobs\" on the run that created it"
             else
               echo "::notice::$TAG is already released, skipping"
             fi

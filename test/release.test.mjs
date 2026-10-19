@@ -15,9 +15,10 @@ const step = (id) => block(WORKFLOW, 'run', new RegExp(`^\\s*(- )?id: ${id}\\s*$
 const FAKE_GH = `#!/bin/bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 case "$*" in
-  "api repos/"*"/milestones/"*" --jq "*) echo "\${FAKE_STATE:-closed} \${FAKE_OPEN:-0}" ;;
+  "api repos/"*"/milestones/"*" --jq "*) echo "\${FAKE_STATE:-closed} \${FAKE_OPEN:-0} \${FAKE_TITLE:-\$TAG}" ;;
   "api -X PATCH repos/"*"/milestones/"*" -f state=open --silent") ;;
-  "release view "*) [ -n "\${FAKE_RELEASE_EXISTS:-}" ] || { echo "release not found" >&2; exit 1; }
+  "release view "*) [ -z "\${FAKE_RELEASE_VIEW_ERROR:-}" ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+    [ -n "\${FAKE_RELEASE_EXISTS:-}" ] || { echo "release not found" >&2; exit 1; }
     echo "\${FAKE_RELEASE_DRAFT:-false}" ;;
   "api repos/"*"/git/ref/tags/"*" --silent") [ -n "\${FAKE_TAG_EXISTS:-}" ] || { echo "HTTP 404" >&2; exit 1; } ;;
   "api repos/"*"/commits/"*" --jq .sha") echo "\${FAKE_SHA:-0123abc}" ;;
@@ -165,15 +166,30 @@ test('a draft release with the same tag reopens the milestone and fails', () => 
   assert.match(r.out, /::error::A draft release v1\.2\.0 exists/)
 })
 
-test('a re-run of a run whose release exists asks the caller to publish again', () => {
+test('a re-run never publishes an existing release on its own, and says how to', () => {
+  // The release may be an old tag or the work of a later run; only
+  // "Re-run failed jobs" (which keeps the release job's outputs) publishes again.
   const rerun = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_RELEASE_EXISTS: '1', ATTEMPT: '2' })
   assert.equal(rerun.status, 0, rerun.out)
   assert.equal(rerun.outputs.go, 'false')
-  assert.equal(rerun.outputs.republish, 'true')
-  const first = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_RELEASE_EXISTS: '1', ATTEMPT: '1' })
-  assert.equal(first.outputs.republish, undefined)
+  assert.equal(rerun.outputs.republish, undefined)
+  assert.match(rerun.out, /Re-run failed jobs/)
 })
 
-test('the released output covers a re-run that publishes again', () => {
-  assert.match(readFileSync(WORKFLOW, 'utf8'), /released: \$\{\{ steps\.release\.outputs\.released \|\| steps\.decide\.outputs\.republish \|\| 'false' \}\}/)
+test('the released output is only the release step', () => {
+  assert.match(readFileSync(WORKFLOW, 'utf8'), /released: \$\{\{ steps\.release\.outputs\.released \|\| 'false' \}\}/)
+})
+
+test('skips when the milestone was renamed since the event', () => {
+  const r = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_TITLE: 'v1.2.1' })
+  assert.equal(r.status, 0, r.out)
+  assert.equal(r.outputs.go, 'false')
+  assert.match(r.out, /renamed/)
+})
+
+test('fails loudly when the release lookup errors for another reason', () => {
+  const r = runStep(sandbox(), 'decide', { TAG: 'v1.2.0', FAKE_RELEASE_VIEW_ERROR: '1' })
+  assert.notEqual(r.status, 0)
+  assert.match(r.out, /::error::Could not check for an existing release/)
+  assert.ok(!r.calls.some((c) => c.startsWith('gh release create')))
 })
