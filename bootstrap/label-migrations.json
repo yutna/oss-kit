@@ -1,7 +1,6 @@
 {
   "rename": [
     { "from": "feature", "to": "enhancement" },
-    { "from": "proposal", "to": "enhancement" },
     { "from": "breaking-change", "to": "breaking" },
     { "from": "priority: p1", "to": "priority: high" },
     { "from": "priority: p3", "to": "priority: low" }
@@ -19,16 +18,8 @@
     "github_actions"
   ],
   "extensions": {
-    "yutna/functional-design-skills": ["skill"],
-    "yutna/gherkin-specification-skills": ["skill"],
-    "yutna/ollama-bar": ["area: app", "area: ci", "accessibility", "localization"],
-    "yutna/pixel-factory": [
-      "agent:ready", "agent:running", "agent:review", "agent:blocked", "agent:done",
-      "ai-generated", "hold", "accessibility"
-    ],
-    "yutna/agent-workflow-template": [
-      "agent:ready", "agent:running", "agent:review", "agent:blocked", "agent:done",
-      "ai-generated", "hold", "accessibility"
-    ]
+    "yutna/functional-design-skills": ["skill", "proposal"],
+    "yutna/gherkin-specification-skills": ["skill", "proposal"],
+    "yutna/ollama-bar": ["area: app", "area: ci", "accessibility", "localization"]
   }
 }
