@@ -9,7 +9,8 @@ label and ruleset definitions they apply. Every public repository gets the
 same core regardless of language; stack-specific parts (CI jobs, ignore
 files, Dependabot ecosystems, publishing) are added on top per repository.
 
-The rules themselves are in [docs/conventions.md](docs/conventions.md).
+The rules themselves are in [docs/conventions.md](docs/conventions.md). To bring an existing
+repository onto the workflow, follow [docs/adopting.md](docs/adopting.md).
 
 ## What lives where
 
