@@ -18,7 +18,7 @@ function tmp() {
 }
 
 // Runs `snippet` after sourcing the CLI as a library.
-function lib(snippet, { env = {}, cwd } = {}) {
+function lib(snippet, { env = {}, cwd = tmp() } = {}) {
   const r = spawnSync(BASH, ['-c', `OSS_KIT_LIB=1 . "${CLI}" && ${snippet}`], {
     encoding: 'utf8', cwd, env: { ...process.env, ...env },
   })
@@ -246,9 +246,10 @@ function fakeGh(dir, script) {
   return bin
 }
 
+// Runs in a throwaway directory, so nothing a test does can land in this repo.
 function cli(args, { bin } = {}) {
   const r = spawnSync(BASH, [CLI, ...args], {
-    encoding: 'utf8', env: { ...process.env, PATH: bin ? `${bin}:${process.env.PATH}` : process.env.PATH },
+    encoding: 'utf8', cwd: tmp(), env: { ...process.env, PATH: bin ? `${bin}:${process.env.PATH}` : process.env.PATH },
   })
   return { status: r.status, out: r.stdout, err: r.stderr }
 }
