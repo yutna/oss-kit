@@ -35,7 +35,7 @@ function milestone(number, title) {
 
 // state: { pr, milestones, linked: [[...nodes], ...] } — `linked` is the
 // sequence of GraphQL answers; the last one repeats.
-async function run({ pr, milestones = [], linked = [[]], unassignable = [] }) {
+async function run({ pr, milestones = [], linked = [[]], unassignable = [], graphqlError = null }) {
   const state = structuredClone({ pr, milestones })
   state.pr.labels ??= []
   state.pr.assignees ??= []
@@ -83,6 +83,7 @@ async function run({ pr, milestones = [], linked = [[]], unassignable = [] }) {
     rest,
     paginate: async (fn, params) => (await fn(params)).data,
     graphql: async () => {
+      if (graphqlError) throw new Error(graphqlError)
       const nodes = linked[Math.min(graphqlCalls, linked.length - 1)]
       graphqlCalls += 1
       return { repository: { pullRequest: { closingIssuesReferences: { nodes } } } }
@@ -388,4 +389,48 @@ test('assigns the repository owner when the author cannot be assigned', async ()
   })
   assert.deepEqual(r.pr.assignees.map((a) => a.login), [OWNER])
   assert.equal(r.failed, false, r.message)
+})
+
+// --- robustness (deferred minors) -------------------------------------------
+
+test('reports a GitHub API error readably and still sets the kind label', async () => {
+  const r = await run({
+    pr: good({ milestone: null, body: 'Closes #3' }),
+    milestones: [V010],
+    graphqlError: 'Something went wrong while executing your query',
+  })
+  assert.equal(r.failed, true)
+  assert.match(r.message, /could not read the linked issues/)
+  assert.deepEqual(r.labels, ['enhancement'])
+})
+
+test('ignores linked issues the token cannot see', async () => {
+  const r = await run({
+    pr: good({ milestone: null, body: 'Closes #3' }),
+    milestones: [V010, V020],
+    linked: [[null, { number: 4, milestone: null, repository: null }, issue(3, V020)]],
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.2.0')
+  assert.equal(r.failed, false, r.message)
+})
+
+test('matches kind labels case-insensitively', async () => {
+  const fix = await run({ pr: good({ title: 'fix: x', labels: [{ name: 'Enhancement' }] }), milestones: [V010] })
+  assert.deepEqual(fix.labels, ['bug'])
+  const feat = await run({ pr: good({ title: 'feat: x', labels: [{ name: 'Enhancement' }, { name: 'Breaking' }] }), milestones: [V010] })
+  assert.deepEqual(feat.calls.filter(([c]) => c === 'addLabels'), [])
+  assert.deepEqual(feat.labels, ['Enhancement'])
+})
+
+test('escapes the pull request title in the job summary', async () => {
+  const r = await run({ pr: good({ title: 'update ![x](https://evil.example/a.png)' }), milestones: [V010] })
+  assert.equal(r.failed, true)
+  assert.doesNotMatch(r.summary, /!\[x\]\(https/)
+  assert.match(r.summary, /evil\\?\.example/)
+})
+
+test('the caller re-checks a pull request when its labels change', () => {
+  const caller = readFileSync(fileURLToPath(new URL('../.github/workflows/self-pr-check.yml', import.meta.url)), 'utf8')
+  assert.match(caller, /\blabeled\b/)
+  assert.match(caller, /\bunlabeled\b/)
 })
