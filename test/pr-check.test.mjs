@@ -36,7 +36,8 @@ function milestone(number, title) {
 // state: { pr, milestones, linked: [[...nodes], ...] } — `linked` is the
 // sequence of GraphQL answers; the last one repeats.
 async function run({ pr, milestones = [], linked = [[]], unassignable = [], graphqlError = null,
-  graphqlPartial = null, serverErrorOn = [], serverErrorApplies = true, latestRelease = null, milestoneRace = false }) {
+  graphqlPartial = null, serverErrorOn = [], serverErrorApplies = true, tags = [], milestoneRace = false,
+  raceOnListAll = null, createError = null }) {
   const state = structuredClone({ pr, milestones })
   state.pr.labels ??= []
   state.pr.assignees ??= []
@@ -60,11 +61,10 @@ async function run({ pr, milestones = [], linked = [[]], unassignable = [], grap
     pulls: {
       get: async () => ({ data: structuredClone(state.pr) }),
     },
-    repos: {
-      getLatestRelease: async () => {
-        if (!latestRelease) throw Object.assign(new Error('Not Found'), { status: 404 })
-        return { data: { tag_name: latestRelease } }
-      },
+    git: {
+      listMatchingRefs: async ({ ref }) => ({
+        data: tags.filter((t) => `tags/${t}`.startsWith(ref)).map((t) => ({ ref: `refs/tags/${t}` })),
+      }),
     },
     issues: {
       addAssignees: async ({ assignees }) => {
@@ -96,15 +96,25 @@ async function run({ pr, milestones = [], linked = [[]], unassignable = [], grap
         state.pr.labels = state.pr.labels.filter((l) => l.name !== name)
         return { data: [] }
       },
-      listMilestones: async ({ state: wanted = 'open' }) => ({
-        data: structuredClone(state.milestones.filter((m) => wanted === 'all' || m.state === wanted)),
-      }),
+      listMilestones: async ({ state: wanted = 'open' }) => {
+        // Another run creates the milestone between our two listings.
+        if (wanted === 'all' && raceOnListAll && !state.milestones.some((m) => m.title === raceOnListAll)) {
+          state.milestones.push({ number: 200, title: raceOnListAll, state: 'open' })
+        }
+        return {
+          data: structuredClone(state.milestones.filter((m) => wanted === 'all' || m.state === wanted)),
+        }
+      },
       createMilestone: async ({ title }) => {
         calls.push(['createMilestone', title])
         const make = () => {
           const m = { number: 100 + state.milestones.length, title, state: 'open' }
           state.milestones.push(m)
           return m
+        }
+        if (createError) {
+          make() // the request landed, the answer did not
+          throw Object.assign(new Error('Server Error'), { status: createError })
         }
         if (milestoneRace) {
           make() // another run got there first
@@ -300,11 +310,11 @@ test('creates the next patch milestone for a bot pull request when no version mi
   assert.equal(r.failed, false, r.message)
 })
 
-test('counts a newer release than any milestone when choosing the next patch', async () => {
+test('counts a newer tag than any milestone when choosing the next patch', async () => {
   const r = await run({
     pr: good(BOT),
     milestones: [{ number: 1, title: 'v0.1.0', state: 'closed' }],
-    latestRelease: 'v0.1.3',
+    tags: ['v0.1.0', 'v0.1.3'],
   })
   assert.equal(r.pr.milestone?.title, 'v0.1.4')
 })
@@ -564,4 +574,35 @@ test('uses the partial data of a GraphQL error', async () => {
 
 test('the github-script step retries server errors', () => {
   assert.match(readFileSync(WORKFLOW, 'utf8'), /^\s+retries: 3$/m)
+})
+
+// --- bot milestones in version order (round 4 review) ------------------------
+
+test('two bot runs racing end up in one milestone', async () => {
+  const r = await run({
+    pr: good(BOT),
+    milestones: [{ number: 1, title: 'v0.1.0', state: 'closed' }],
+    raceOnListAll: 'v0.1.1',
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.1.1')
+  assert.deepEqual(r.calls.filter(([c]) => c === 'createMilestone'), [])
+})
+
+test('the next patch skips versions that already exist as tags', async () => {
+  const r = await run({
+    pr: good(BOT),
+    milestones: [{ number: 1, title: 'v0.3.0', state: 'closed' }],
+    tags: ['v0.3.0', 'v0.3.1', 'not-a-version'],
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.3.2')
+})
+
+test('a server error while creating the milestone falls back to it once it exists', async () => {
+  const r = await run({
+    pr: good(BOT),
+    milestones: [{ number: 1, title: 'v0.1.0', state: 'closed' }],
+    createError: 502,
+  })
+  assert.equal(r.pr.milestone?.title, 'v0.1.1')
+  assert.equal(r.failed, false, r.message)
 })
