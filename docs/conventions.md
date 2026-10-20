@@ -47,7 +47,9 @@ touches other labels:
   version milestone, plus type and priority labels.
 - A pull request must be in a version milestone before it can merge. It
   inherits the milestone of the issue it closes; Dependabot pull requests get
-  the lowest open version milestone.
+  the lowest open version milestone, and when none is open pr-check creates
+  the next patch milestone (after the highest version milestone or latest
+  release) for them. Rename it to release them as another version.
 - Moving unfinished issues to a later milestone is normal.
 
 ## Releases
@@ -70,10 +72,9 @@ touches other labels:
 - If `publish` fails, fix the cause and use **Re-run failed jobs** on that
   run: it keeps the release job's outputs. "Re-run all jobs" finds the
   release already made and skips publishing.
-- **After a release, create the next version milestone.** Until one is open,
-  Dependabot pull requests fail pr-check ("create the next version
-  milestone"). Creating it does not re-run their checks: re-run pr-check on
-  them, or edit them.
+- After a release you need not plan the next version right away: bot pull
+  requests get a next-patch milestone made for them, and your own work gets
+  a version milestone when you triage it.
 - Release tags `v*` cannot be deleted or moved. To fix a bad tag, disable the
   `release-tags` ruleset temporarily.
 
