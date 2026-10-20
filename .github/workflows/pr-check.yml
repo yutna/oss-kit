@@ -138,18 +138,20 @@ jobs:
 
             // After a release no version milestone may be open, and a bot pull
             // request (security updates too) would then wait for a person. Bots
-            // get the next patch after the highest version milestone or latest
-            // release; rename the milestone to release it as another version.
+            // get the next patch after the highest version milestone or tag;
+            // rename the milestone to release it as another version.
             const createNextPatch = async (lowestOpen) => {
               const all = await github.paginate(github.rest.issues.listMilestones,
                 { owner, repo, state: 'all', per_page: 100 })
+              // Another run may have made one since we looked: use it, never a second.
+              const already = all.filter(isOpenVersion).sort(bySemver)[0]
+              if (already) return already
+              // Every vX.Y.Z tag counts, released or not, so the new version is
+              // above anything already tagged.
+              const refs = await github.paginate(github.rest.git.listMatchingRefs,
+                { owner, repo, ref: 'tags/v', per_page: 100 })
               const known = all.filter(isVersion)
-              try {
-                const { data } = await github.rest.repos.getLatestRelease({ owner, repo })
-                if (VERSION.test(data.tag_name)) known.push({ title: data.tag_name })
-              } catch (error) {
-                if (error.status !== 404) throw error
-              }
+                .concat(refs.map((r) => ({ title: r.ref.replace(/^refs\/tags\//, '') })).filter(isVersion))
               const top = known.sort(bySemver).pop()
               const title = top ? (([a, b, c]) => `v${a}.${b}.${c + 1}`)(semver(top.title)) : 'v0.1.0'
               try {
@@ -158,8 +160,9 @@ jobs:
                 core.notice(`created milestone ${title}: no version milestone was open`)
                 return data
               } catch (error) {
-                // Another run made it a moment earlier.
-                if (error.status !== 422) throw error
+                // Another run made it a moment earlier (422), or the request
+                // landed but its answer was lost (5xx).
+                if (error.status !== 422 && !(error.status >= 500)) throw error
                 return lowestOpen()
               }
             }

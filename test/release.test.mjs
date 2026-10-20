@@ -20,6 +20,7 @@ case "$*" in
   "release view "*) [ -z "\${FAKE_RELEASE_VIEW_ERROR:-}" ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     [ -n "\${FAKE_RELEASE_EXISTS:-}" ] || { echo "release not found" >&2; exit 1; }
     echo "\${FAKE_RELEASE_DRAFT:-false}" ;;
+  "api repos/"*"/git/matching-refs/tags/v --paginate --jq .[].ref") printf "%b" "\${FAKE_TAGS:-}" ;;
   "api repos/"*"/git/ref/tags/"*" --silent") [ -n "\${FAKE_TAG_EXISTS:-}" ] || { echo "HTTP 404" >&2; exit 1; } ;;
   "api repos/"*"/commits/"*" --jq .sha") echo "\${FAKE_SHA:-0123abc}" ;;
   "release create "*) ;;
@@ -192,4 +193,18 @@ test('fails loudly when the release lookup errors for another reason', () => {
   assert.notEqual(r.status, 0)
   assert.match(r.out, /::error::Could not check for an existing release/)
   assert.ok(!r.calls.some((c) => c.startsWith('gh release create')))
+})
+
+test('refuses to tag newer code with a version below an existing tag', () => {
+  const r = runStep(sandbox(), 'decide', { TAG: 'v0.3.1', FAKE_TAGS: 'refs/tags/v0.3.0\\nrefs/tags/v0.4.0\\nrefs/tags/v0.10.0-rc.1\\n' })
+  assert.notEqual(r.status, 0)
+  assert.equal(reopened(r.calls), true)
+  assert.match(r.out, /::error::v0\.3\.1 is lower than v0\.4\.0/)
+  assert.match(r.out, /v0\.4\.1/)
+})
+
+test('releases a version above every existing tag', () => {
+  const r = runStep(sandbox(), 'decide', { TAG: 'v0.10.0', FAKE_TAGS: 'refs/tags/v0.3.0\\nrefs/tags/v0.9.2\\n' })
+  assert.equal(r.status, 0, r.out)
+  assert.equal(r.outputs.go, 'true')
 })

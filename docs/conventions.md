@@ -46,10 +46,10 @@ touches other labels:
 - An issue without a milestone is untriaged. Triage = choose `Backlog` or a
   version milestone, plus type and priority labels.
 - A pull request must be in a version milestone before it can merge. It
-  inherits the milestone of the issue it closes; Dependabot pull requests get
-  the lowest open version milestone, and when none is open pr-check creates
-  the next patch milestone (after the highest version milestone or latest
-  release) for them. Rename it to release them as another version.
+  inherits the milestone of the issue it closes. Bot pull requests
+  (Dependabot and other apps) get the lowest open version milestone, and when
+  none is open pr-check creates the next patch milestone (after the highest
+  version milestone or tag) for them.
 - Moving unfinished issues to a later milestone is normal.
 
 ## Releases
@@ -73,8 +73,13 @@ touches other labels:
   run: it keeps the release job's outputs. "Re-run all jobs" finds the
   release already made and skips publishing.
 - After a release you need not plan the next version right away: bot pull
-  requests get a next-patch milestone made for them, and your own work gets
-  a version milestone when you triage it.
+  requests get a next-patch milestone made for them. When you do plan it,
+  **rename that milestone** to the version you want (e.g. `v0.3.1` →
+  `v0.4.0`) instead of opening a second one. A version below one already
+  tagged is refused at release: the milestone is reopened with the version
+  to rename it to.
+- If a bot pull request still fails with "create the next version milestone"
+  (GitHub was briefly unavailable), re-run its pr-check.
 - Release tags `v*` cannot be deleted or moved. To fix a bad tag, disable the
   `release-tags` ruleset temporarily.
 

@@ -118,6 +118,31 @@ jobs:
             exit 0
           fi
 
+          # Never tag newer code with a lower version, e.g. a bot's patch
+          # milestone (v0.3.1) left open after a higher release (v0.4.0).
+          version_lt() { # true when vA.B.C is lower than vX.Y.Z
+            local a b i
+            IFS=. read -r -a a <<< "${1#v}"
+            IFS=. read -r -a b <<< "${2#v}"
+            for i in 0 1 2; do
+              if [ "${a[$i]}" -lt "${b[$i]}" ]; then return 0; fi
+              if [ "${a[$i]}" -gt "${b[$i]}" ]; then return 1; fi
+            done
+            return 1
+          }
+          refs=$(gh api "repos/$REPO/git/matching-refs/tags/v" --paginate --jq '.[].ref')
+          highest=""
+          for ref in $refs; do
+            v=${ref#refs/tags/}
+            [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            if [ -z "$highest" ] || version_lt "$highest" "$v"; then highest=$v; fi
+          done
+          if [ -n "$highest" ] && version_lt "$TAG" "$highest"; then
+            gh api -X PATCH "repos/$REPO/milestones/$NUMBER" -f state=open --silent
+            echo "::error::$TAG is lower than $highest, which is already tagged: rename this milestone (e.g. to ${highest%.*}.$(( ${highest##*.} + 1 ))) and close it again; reopened"
+            exit 1
+          fi
+
           # Pin the commit so preflight checks exactly what gets tagged.
           sha=$(gh api "repos/$REPO/commits/$BRANCH" --jq .sha)
           {
