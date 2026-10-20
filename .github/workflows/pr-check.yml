@@ -136,6 +136,34 @@ jobs:
               }
             }
 
+            // After a release no version milestone may be open, and a bot pull
+            // request (security updates too) would then wait for a person. Bots
+            // get the next patch after the highest version milestone or latest
+            // release; rename the milestone to release it as another version.
+            const createNextPatch = async (lowestOpen) => {
+              const all = await github.paginate(github.rest.issues.listMilestones,
+                { owner, repo, state: 'all', per_page: 100 })
+              const known = all.filter(isVersion)
+              try {
+                const { data } = await github.rest.repos.getLatestRelease({ owner, repo })
+                if (VERSION.test(data.tag_name)) known.push({ title: data.tag_name })
+              } catch (error) {
+                if (error.status !== 404) throw error
+              }
+              const top = known.sort(bySemver).pop()
+              const title = top ? (([a, b, c]) => `v${a}.${b}.${c + 1}`)(semver(top.title)) : 'v0.1.0'
+              try {
+                const { data } = await github.rest.issues.createMilestone({ owner, repo, title,
+                  description: 'Created by pr-check for a bot pull request; rename it to release another version.' })
+                core.notice(`created milestone ${title}: no version milestone was open`)
+                return data
+              } catch (error) {
+                // Another run made it a moment earlier.
+                if (error.status !== 422) throw error
+                return lowestOpen()
+              }
+            }
+
             let linked = []
             if (!isOpenVersion(pr.milestone)) {
               linked = await linkedIssues()
@@ -144,9 +172,10 @@ jobs:
                 await write('set milestone', () => github.rest.issues.update({ owner, repo, issue_number: number, milestone: target.number }))
                 core.info(`milestone set to ${target.title} from the linked issue`)
               } else if (isBot) {
-                const open = await github.paginate(github.rest.issues.listMilestones,
-                  { owner, repo, state: 'open', per_page: 100 })
-                const next = open.filter(isVersion).sort(bySemver)[0]
+                const lowestOpen = async () => (await github.paginate(github.rest.issues.listMilestones,
+                  { owner, repo, state: 'open', per_page: 100 })).filter(isOpenVersion).sort(bySemver)[0]
+                let next = await lowestOpen()
+                if (!next) next = await createNextPatch(lowestOpen)
                 if (next) {
                   await write('set milestone', () => github.rest.issues.update({ owner, repo, issue_number: number, milestone: next.number }))
                   core.info(`milestone set to ${next.title}, the lowest open version milestone`)

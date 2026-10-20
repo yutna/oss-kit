@@ -76,7 +76,8 @@ jobs:
 ```
 
 - **pr-check** assigns the author (the owner for bots), inherits the linked
-  issue's version milestone (bots get the lowest open one), sets the kind
+  issue's version milestone (bots get the lowest open one, or a new next-patch
+  milestone when none is open), sets the kind
   label from the title, then fails unless the title is Conventional Commits,
   there is an assignee and the milestone is `vX.Y.Z`. Required check:
   `pr-check / check`.
